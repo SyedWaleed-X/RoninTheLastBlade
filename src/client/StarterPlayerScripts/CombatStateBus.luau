@@ -23,9 +23,18 @@ type StateMachineInstance = StateMachine.StateMachine
 
 export type TransitionListener = (fromState: CombatState, toState: CombatState) -> ()
 
+export type ConsumedInputRecord = {
+	Action: string,
+	LatencyDelta: number,
+	Timestamp: number,
+}
+
+local MAX_CONSUMED_HISTORY = 3
+
 local activeMachine: StateMachineInstance? = nil
 local disconnectTransitions: (() -> ())? = nil
 local listeners: { TransitionListener } = {}
+local consumedHistory: { ConsumedInputRecord } = {}
 
 local bus = {}
 
@@ -139,6 +148,27 @@ function bus.ForceResetToIdle(): boolean
 	emit(currentState, "Idle")
 
 	return true
+end
+
+--[[
+	Records a consumed input event and its latency delta into the recent history ring.
+]]
+function bus.RecordConsumed(action: string, latencyDelta: number)
+	table.insert(consumedHistory, 1, {
+		Action = action,
+		LatencyDelta = latencyDelta,
+		Timestamp = os.clock(),
+	})
+	if #consumedHistory > MAX_CONSUMED_HISTORY then
+		table.remove(consumedHistory)
+	end
+end
+
+--[[
+	Returns the recent history of consumed inputs (at most 3 items).
+]]
+function bus.GetConsumedHistory(): { ConsumedInputRecord }
+	return consumedHistory
 end
 
 return bus

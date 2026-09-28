@@ -28,6 +28,7 @@ local StateMachine = require(ReplicatedStorage:WaitForChild("StateMachine") :: M
 -- Client-local bridge: publishes the bound machine to observers (the debug HUD) and to
 -- the keyboard/chaos harness. Every client script shares the one bus in PlayerScripts.
 local CombatStateBus = require(script.Parent:WaitForChild("CombatStateBus") :: ModuleScript)
+local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleScript)
 
 local localPlayer = Players.LocalPlayer
 
@@ -58,6 +59,11 @@ local function bindCharacter(character: Model): () -> ()
 		interval in seconds since the previous transition, read from the machine's own
 		LastTransitionTime so the value is not skewed by the machine's deferred
 		(task.spawn) listener dispatch.
+
+		Also drives the action consumption loop (Day 3):
+		  - Idle: consumes buffered action and dispatches transition (LightAttack -> Windup, Guard -> Blocking).
+		  - Stunned: clears input buffer to prevent actions queued during/before hitstun.
+		  - Recovery: keeps listening, allowing new inputs to fill the buffer.
 	]]
 	local function onStateChanged(fromState: string, toState: string)
 		local transitionClock = machine.LastTransitionTime
@@ -65,6 +71,24 @@ local function bindCharacter(character: Model): () -> ()
 		lastTransitionClock = transitionClock
 
 		print(string.format("[COMBAT] State changed: %s -> %s (dt: %.3f)", fromState, toState, dt))
+
+		if toState == "Idle" then
+			local action, latencyDelta = InputBuffer.Consume()
+			if action then
+				CombatStateBus.RecordConsumed(action, latencyDelta or 0)
+
+				if action == "LightAttack" then
+					machine:SetState("Windup")
+				elseif action == "Guard" then
+					machine:SetState("Blocking")
+				end
+			end
+		elseif toState == "Stunned" then
+			-- Immediately flush queued actions: no attacks after hitstun
+			InputBuffer.Clear()
+		elseif toState == "Recovery" then
+			-- Keep listening, allowing new inputs to fill the buffer
+		end
 	end
 
 	disconnectStateChanged = machine:OnStateChanged(onStateChanged)
@@ -94,6 +118,9 @@ local function bindCharacter(character: Model): () -> ()
 
 		-- Stop feeding client observers before the machine is retired.
 		CombatStateBus.Release(machine)
+
+		-- Clear buffered inputs on death/respawn
+		InputBuffer.Clear()
 
 		-- 2) Neutralise the machine. Disposal is not a combat transition, so a
 		--    table-legal move goes through SetState; dying mid-strike (Active -> Idle)

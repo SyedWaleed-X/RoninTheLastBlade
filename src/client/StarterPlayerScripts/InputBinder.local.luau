@@ -45,6 +45,10 @@ local UserInputService = game:GetService("UserInputService")
 -- buffer the binder pushes into.
 local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleScript)
 
+-- Debug-only gate the Day 3 chaos suite flips to keep live keypresses out of the
+-- buffer while it asserts. Open by default; this binder only ever reads it.
+local InputGate = require(script.Parent:WaitForChild("InputGate") :: ModuleScript)
+
 type CombatAction = InputBuffer.CombatAction
 
 --[[
@@ -104,7 +108,7 @@ end
 	buffer records intent, it does not claim the input.
 ]]
 local function onActionInput(action: CombatAction, inputState: Enum.UserInputState): Enum.ContextActionResult
-	if isGameProcessed() then
+	if InputGate.IsGated() or isGameProcessed() then
 		return Enum.ContextActionResult.Pass
 	end
 

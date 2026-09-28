@@ -16,8 +16,9 @@
 	  * Peek             - reads the queued action without spending it. Returns nil as
 	                       soon as the entry is consumed or older than BUFFER_WINDOW,
 	                       and drops that stale entry on the same read.
-	  * Consume          - reads and spends the queued action, so one press can only
-	                       ever produce one action.
+	  * Consume          - reads and spends the queued action, returning the action
+	                       and the latency delta (seconds since pushed), so one press
+	                       can only ever produce one action.
 	  * Clear            - flushes everything immediately: the Stun / Ragdoll input
 	                       lock (COMBAT_SPEC §1) and respawn use this.
 	  * GetTimeRemaining - milliseconds left in the window, 0 when nothing is queued.
@@ -113,18 +114,19 @@ end
 
 --[[
 	Returns the queued action and marks it consumed, so a second Consume for the same
-	press returns nil. The spent entry is left in place (flagged) until the next Push
-	or Clear, which keeps the queue slot single-valued without extra bookkeeping.
+	press returns nil. Returns (action, latencyDelta) where latencyDelta is seconds
+	elapsed between Push and Consume.
 ]]
-function InputBuffer.Consume(): CombatAction?
+function InputBuffer.Consume(): (CombatAction?, number?)
 	local pending = readPending()
 	if not pending then
-		return nil
+		return nil, nil
 	end
 
 	pending.Consumed = true
+	local latencyDelta = os.clock() - pending.Timestamp
 
-	return pending.Action
+	return pending.Action, latencyDelta
 end
 
 --[[
