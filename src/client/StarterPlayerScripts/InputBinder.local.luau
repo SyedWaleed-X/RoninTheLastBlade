@@ -45,6 +45,10 @@ local UserInputService = game:GetService("UserInputService")
 -- buffer the binder pushes into.
 local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleScript)
 
+-- Day 4 · Part 2/2: the press is handed to CombatController, which owns the machine
+-- and is the only place that knows whether the action is legal right now.
+local CombatStateBus = require(script.Parent:WaitForChild("CombatStateBus") :: ModuleScript)
+
 -- Debug-only gate the Day 3 chaos suite flips to keep live keypresses out of the
 -- buffer while it asserts. Open by default; this binder only ever reads it.
 local InputGate = require(script.Parent:WaitForChild("InputGate") :: ModuleScript)
@@ -118,9 +122,24 @@ local function onActionInput(action: CombatAction, inputState: Enum.UserInputSta
 		return Enum.ContextActionResult.Pass
 	end
 
-	InputBuffer.Push(action)
+	--[[
+		Day 4 · Part 2/2: the press is offered to the bound machine, which either
+		spends it on the spot (the character is already Idle) or queues it for the next
+		Idle entry. Before this, every press went straight into the queue and the queue
+		was only ever read on a transition *into* Idle, so a click made while the
+		character was already actionable sat unspent until something else had to move
+		the machine first - to the player, a dropped input.
 
-	print(string.format("[INPUT BUFFER] Queued: %s at %.3f", action, os.clock()))
+		The decision is deliberately not made here. CombatController owns the machine
+		and the single action -> transition mapping; this binder is a sink, and a
+		second copy of the "is it legal yet" rule in the binder is exactly how the two
+		paths would drift apart.
+	]]
+	if CombatStateBus.OfferIntent(action) then
+		print(string.format("[INPUT] Spent on the spot: %s at %.3f", action, os.clock()))
+	else
+		print(string.format("[INPUT BUFFER] Queued: %s at %.3f", action, os.clock()))
+	end
 
 	return Enum.ContextActionResult.Pass
 end

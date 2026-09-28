@@ -32,6 +32,72 @@ local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleS
 
 local localPlayer = Players.LocalPlayer
 
+type CombatAction = InputBuffer.CombatAction
+
+--[[
+	Action -> effect. The single mapping from a spent intent to the transition it
+	causes, shared by the two paths that can spend one: the Idle branch of the
+	transition handler below, and the direct intake further down.
+
+	There is exactly one copy of this mapping on purpose. A LightAttack pressed while
+	the character is already Idle has to behave identically to the same press spent a
+	frame later by the Idle handler; two copies of "what does Guard do" is precisely
+	how those two paths would drift apart.
+]]
+local function dispatchAction(action: CombatAction): boolean
+	if action == "LightAttack" then
+		-- The swing is not a single Idle -> Windup edge any more. AttackController
+		-- requests the Windup itself and then drives Active, Recovery and Idle on its
+		-- own frame-data timers, so this only spends the input and hands over. It is
+		-- reached through the bus because `require` cannot load a LocalScript.
+		return CombatStateBus.RunLightAttack()
+	elseif action == "Guard" then
+		return CombatStateBus.RequestState("Blocking")
+	end
+
+	-- Dodge and Execute are bound and queued but have no transition wired up yet.
+	return false
+end
+
+--[[
+	Day 4 · Part 2/2 — direct intake, registered on the bus for InputBinder.
+
+	A press made while the character is already Idle is spent immediately, in the same
+	callback that observed it, instead of waiting for a transition into Idle that may
+	never come. Before this the only read of the queue was the Idle branch below, so a
+	click made while the character was standing still sat unspent until something else
+	had to move the machine first.
+
+	Two details make the direct path safe to add:
+
+	  * The press evicts whatever an earlier press left in the queue before it is
+	    spent. InputBuffer is a single slot with a "latest press wins" rule, and this
+	    path bypasses Push, so without the eviction a guard tapped 150ms earlier
+	    would still be sitting there and would be spent *instead* of the attack the
+	    player just made - the newest intent silently lost.
+	  * Latency is reported as 0 because that is the truth here: the intent is
+	    dispatched inside the input event itself, so the telemetry panel's "spend
+	    latency" for a direct press really is zero.
+]]
+local function offerIntent(action: CombatAction): boolean
+	InputBuffer.Clear()
+
+	local machine = CombatStateBus.GetActiveMachine()
+	if machine == nil or machine.CurrentState ~= "Idle" then
+		-- Busy: the intent goes into the queue and the Idle branch of
+		-- onStateChanged spends it the instant the character becomes actionable.
+		-- This is the COMBAT_SPEC §2.4 chaining path, unchanged.
+		InputBuffer.Push(action)
+		return false
+	end
+
+	CombatStateBus.RecordConsumed(action, 0)
+
+	return dispatchAction(action)
+end
+
+CombatStateBus.SetActionIntake(offerIntent)
+
 -- Teardown of the character that is currently bound; nil while no character is bound.
 local activeTeardown: (() -> ())? = nil
 
@@ -61,7 +127,8 @@ local function bindCharacter(character: Model): () -> ()
 		(task.spawn) listener dispatch.
 
 		Also drives the action consumption loop (Day 3):
-		  - Idle: consumes buffered action and dispatches transition (LightAttack -> Windup, Guard -> Blocking).
+		  - Idle: consumes buffered action and dispatches it (Day 4: LightAttack ->
+		            AttackController, which owns the whole swing; Guard -> Blocking).
 		  - Stunned: clears input buffer to prevent actions queued during/before hitstun.
 		  - Recovery: keeps listening, allowing new inputs to fill the buffer.
 	]]
@@ -73,15 +140,21 @@ local function bindCharacter(character: Model): () -> ()
 		print(string.format("[COMBAT] State changed: %s -> %s (dt: %.3f)", fromState, toState, dt))
 
 		if toState == "Idle" then
+			--[[
+				Listeners are dispatched with task.spawn, so the machine can already
+				have left Idle by the time this body runs - the direct intake above can
+				start a swing in that window. Re-checking here is what stops one press
+				being spent twice: the intake has already emptied the queue, and a swing
+				it started is not ours to start again.
+			]]
+			if machine.CurrentState ~= "Idle" then
+				return
+			end
+
 			local action, latencyDelta = InputBuffer.Consume()
 			if action then
 				CombatStateBus.RecordConsumed(action, latencyDelta or 0)
-
-				if action == "LightAttack" then
-					machine:SetState("Windup")
-				elseif action == "Guard" then
-					machine:SetState("Blocking")
-				end
+				dispatchAction(action)
 			end
 		elseif toState == "Stunned" then
 			-- Immediately flush queued actions: no attacks after hitstun

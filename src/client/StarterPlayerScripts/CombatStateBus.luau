@@ -18,8 +18,14 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CombatTypes = require(ReplicatedStorage.CombatTypes)
 local StateMachine = require(ReplicatedStorage.StateMachine)
 
+-- Required for its `CombatAction` type only: Day 4 · Part 2/2 adds a direct-intake
+-- path, so the bus has to name the same action union the queue stores. InputBuffer
+-- has no dependency back on the bus, so this cannot cycle.
+local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleScript)
+
 type CombatState = CombatTypes.CombatState
 type StateMachineInstance = StateMachine.StateMachine
+type CombatAction = InputBuffer.CombatAction
 
 export type TransitionListener = (fromState: CombatState, toState: CombatState) -> ()
 
@@ -29,12 +35,42 @@ export type ConsumedInputRecord = {
 	Timestamp: number,
 }
 
+--[[
+	Signature of the light-attack driver registered by AttackController. Returns
+	whether a swing actually started.
+]]
+export type LightAttackExecutor = () -> boolean
+
+--[[
+	Signature of the direct-intake path registered by CombatController. Given a press,
+	it either spends it on the spot (true) or leaves it queued for the next Idle entry
+	(false).
+]]
+export type ActionIntake = (action: CombatAction) -> boolean
+
 local MAX_CONSUMED_HISTORY = 3
 
 local activeMachine: StateMachineInstance? = nil
 local disconnectTransitions: (() -> ())? = nil
 local listeners: { TransitionListener } = {}
 local consumedHistory: { ConsumedInputRecord } = {}
+
+--[[
+	Day 4: the light-attack executor and the mirror of the live chain index.
+
+	AttackController is a LocalScript (Script Sync `.local.luau` suffix), and
+	`require` only works on ModuleScripts - so CombatController cannot require it and
+	CombatDebugUI cannot read its state. This bus is the client-local seam both of
+	those scripts already share: AttackController registers here, the controller's
+	consumption loop dispatches through here, and the HUD reads the mirrored index
+	from here instead of owning a second copy of the chain state.
+]]
+local lightAttackExecutor: LightAttackExecutor? = nil
+local actionIntake: ActionIntake? = nil
+local activeComboIndex = 1
+-- 0 until AttackController publishes a chain length; the HUD leaves its placeholder
+-- text alone for 0 rather than rendering a "HIT 1 / 0" row.
+local comboTotalHits = 0
 
 local bus = {}
 
@@ -79,6 +115,13 @@ function bus.Release(machine: StateMachineInstance?)
 	end
 
 	activeMachine = nil
+
+	-- The mirrored chain belongs to the character that is going away, so a respawn
+	-- must not leave the HUD advertising a hit the new character never swung. The
+	-- registered executor is deliberately *not* cleared: it is owned by a client
+	-- script whose lifetime is the client, not the character, and dropping it would
+	-- make every post-respawn attack a no-op until the session reloaded.
+	activeComboIndex = 1
 end
 
 function bus.GetActiveMachine(): StateMachineInstance?
@@ -148,6 +191,77 @@ function bus.ForceResetToIdle(): boolean
 	emit(currentState, "Idle")
 
 	return true
+end
+
+--[[
+	Day 4 · Part 1/2: light-attack dispatch.
+
+	Registers the client-local swing driver (AttackController). Registering twice is
+	harmless and idempotent: the last registration wins, so a re-run of the script
+	does not leave the bus pointing at a dead closure.
+]]
+function bus.SetLightAttackExecutor(executor: LightAttackExecutor?)
+	lightAttackExecutor = executor
+end
+
+--[[
+	Runs the registered light-attack driver, returning whether a swing started.
+	Returns false when nothing is registered, which is a real failure (a press that
+	silently does nothing) rather than a normal outcome, so it is reported instead of
+	being swallowed: without this the StateMachine's own transition rules would be
+	the only clue and a LightAttack would simply never fire.
+]]
+function bus.RunLightAttack(): boolean
+	local executor = lightAttackExecutor
+	if executor == nil then
+		warn("[COMBAT] RunLightAttack: no executor registered (is AttackController running?).")
+		return false
+	end
+
+	return executor()
+end
+
+--[[
+	Day 4 · Part 2/2: direct intake for a press made while the character is already
+	actionable. Registers CombatController's intake; registering twice is idempotent
+	(last registration wins), matching SetLightAttackExecutor above.
+]]
+function bus.SetActionIntake(intake: ActionIntake?)
+	actionIntake = intake
+end
+
+--[[
+	Offers a press to the bound machine so it can be spent now rather than on the next
+	transition into Idle.
+
+	Returns true when the controller spent it immediately and false when it queued the
+	press instead (the character was busy). A false is therefore an ordinary outcome,
+	not a failure - InputBinder keys its trace off it. When no controller has
+	registered yet the press is pushed into the Day 3 queue as a fallback, so a
+	machine that binds before the 200ms window closes still spends it.
+]]
+function bus.OfferIntent(action: CombatAction): boolean
+	local intake = actionIntake
+	if intake == nil then
+		InputBuffer.Push(action)
+		return false
+	end
+
+	return intake(action)
+end
+
+--[[
+	Mirrors the live chain index (and the chain length) for observers that cannot
+	require AttackController - today only the debug HUD. `activeIndex` is the hit the
+	character is on, or the hit the next press will play while it sits in Idle.
+]]
+function bus.SetComboState(activeIndex: number, totalHits: number)
+	activeComboIndex = activeIndex
+	comboTotalHits = totalHits
+end
+
+function bus.GetComboState(): (number, number)
+	return activeComboIndex, comboTotalHits
 end
 
 --[[

@@ -9,6 +9,8 @@
 	  * current state badge, colour coded per COMBAT_SPEC state
 	  * previous state
 	  * milliseconds spent in the current state (updated every RenderStepped)
+	  * Day 4: COMBO: [ HIT x / 3 ], the live position in the 3-hit chain, lit while
+	    a swing is in flight and dim while the character is actionable
 	  * feed of the last four transitions
 
 	Directly beneath it sits the Day 3 Input Telemetry panel, which watches the live
@@ -32,7 +34,6 @@ local UserInputService = game:GetService("UserInputService")
 local CombatTypes = require(ReplicatedStorage.CombatTypes)
 local CombatStateBus = require(script.Parent:WaitForChild("CombatStateBus") :: ModuleScript)
 local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleScript)
-local InputGate = require(script.Parent:WaitForChild("InputGate") :: ModuleScript)
 local InputGate = require(script.Parent:WaitForChild("InputGate") :: ModuleScript)
 
 type CombatState = CombatTypes.CombatState
@@ -163,18 +164,25 @@ local durationLabel = createLabel(
 	UDim2.fromOffset(0, 64), UDim2.new(1, 0, 0, 14)
 )
 
+-- Day 4: live 3-hit chain position, mirrored from AttackController through the bus.
+-- Lit while a swing is in flight, dim once the character is actionable again.
+local comboLabel = createLabel(
+	card, "ComboIndex", "COMBO: [ HIT 1 / 3 ]", 13, Enum.Font.GothamBold, TEXT_DIM,
+	UDim2.fromOffset(0, 80), UDim2.new(1, 0, 0, 16)
+)
+
 local divider = Instance.new("Frame")
 divider.Name = "Divider"
 divider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 divider.BackgroundTransparency = 0.85
 divider.BorderSizePixel = 0
-divider.Position = UDim2.new(0, 0, 0, 84)
+divider.Position = UDim2.new(0, 0, 0, 98)
 divider.Size = UDim2.new(1, 0, 0, 1)
 divider.Parent = card
 
 local feedTitleLabel = createLabel(
 	card, "FeedTitle", "TRANSITIONS", 10, Enum.Font.GothamBold, TEXT_DIM,
-	UDim2.fromOffset(0, 92), UDim2.new(1, 0, 0, 12)
+	UDim2.fromOffset(0, 106), UDim2.new(1, 0, 0, 12)
 )
 
 -- Four rows, newest first; filled in by pushHistory.
@@ -182,7 +190,7 @@ local feedRows: { TextLabel } = {}
 for index = 1, HISTORY_DEPTH do
 	local row = createLabel(
 		card, "FeedRow" .. index, "", 11, Enum.Font.Code, TEXT_BRIGHT,
-		UDim2.fromOffset(0, 108 + (index - 1) * 14), UDim2.new(1, 0, 0, 14)
+		UDim2.fromOffset(0, 122 + (index - 1) * 14), UDim2.new(1, 0, 0, 14)
 	)
 	feedRows[index] = row
 end
@@ -316,6 +324,27 @@ CombatStateBus.Subscribe(function(fromState: CombatState, toState: CombatState)
 	pushHistory(fromState, toState)
 end)
 
+--[[
+	Paints the live chain position of the 3-hit attack chain.
+
+	AttackController is a LocalScript, so the HUD cannot require it and reads the index
+	through the bus mirror instead. `inSwing` is derived from the machine rather than
+	tracked separately: Windup/Active/Recovery is exactly the window in which the hit
+	the index names is the hit being played, so the row is lit during a swing and dims
+	once the character is actionable again (showing the hit the next press will play).
+	A chain length of 0 means AttackController has not published one yet, which leaves
+	the placeholder text alone.
+]]
+local function paintComboState(inSwing: boolean)
+	local activeIndex, totalHits = CombatStateBus.GetComboState()
+	if totalHits < 1 then
+		return
+	end
+
+	comboLabel.Text = string.format("COMBO: [ HIT %d / %d ]", activeIndex, totalHits)
+	comboLabel.TextColor3 = if inSwing then COLOR_CYAN else TEXT_DIM
+end
+
 RunService.RenderStepped:Connect(function()
 	local machine = CombatStateBus.GetActiveMachine()
 
@@ -325,6 +354,7 @@ RunService.RenderStepped:Connect(function()
 			paintPreviousState(nil)
 		end
 		durationLabel.Text = "TIME  — ms"
+		paintComboState(false)
 		return
 	end
 
@@ -337,6 +367,8 @@ RunService.RenderStepped:Connect(function()
 
 	local elapsedMs = math.floor((os.clock() - machine.LastTransitionTime) * 1000)
 	durationLabel.Text = string.format("TIME  %d ms", elapsedMs)
+
+	paintComboState(currentState == "Windup" or currentState == "Active" or currentState == "Recovery")
 
 	-- Update Input Telemetry panel (zero per-frame table allocations)
 	local pendingAction = InputBuffer.Peek()
