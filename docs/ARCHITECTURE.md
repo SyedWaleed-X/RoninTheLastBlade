@@ -1,9 +1,10 @@
 # ARCHITECTURE SPECIFICATION
 
 ## Directory Structure
-- `src/server`: Server-authoritative logic (Combat validation, DataManager, Damage pipelines). Mapped to `ServerScriptService`.
-- `src/shared`: Shared types, configurations, state definitions, and utility math. Mapped to `ReplicatedStorage`.
-- `src/client`: Input buffering, local visual prediction, camera shake, and UI. Mapped to `StarterPlayerScripts`.
+## Directory Structure
+- `src/server/ServerScriptService`: Server-authoritative logic. Mapped to `ServerScriptService`.
+- `src/shared/ReplicatedStorage`: Shared types, configurations, state definitions, and utility math. Mapped to `ReplicatedStorage`.
+- `src/client/StarterPlayerScripts`: Input buffering, local visual prediction, camera shake, and UI. Mapped to `StarterPlayerScripts`.
 
 ## Engineering Rules
 1. Every Luau file must begin with `--!strict`.
