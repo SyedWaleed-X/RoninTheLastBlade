@@ -68,6 +68,17 @@ local ParryWindow = require(script.Parent:WaitForChild("ParryWindow") :: ModuleS
 ]]
 local Hitstop = require(script.Parent:WaitForChild("Hitstop") :: ModuleScript)
 
+--[[
+	Day 7 · Part 2/2: the deflect's clang and camera punch.
+
+	Required here because this is the one client-side place that knows a deflect
+	happened *to this player* — both deflect remotes land in this file, and they are
+	the only two events in the project that can say so. Sound and camera are per
+	viewer, so they have to be driven from the viewer's own client, and the
+	punctuation of the parry is not `Hitstop`'s job: see that module's header.
+]]
+local DeflectFeedback = require(script.Parent:WaitForChild("DeflectFeedback") :: ModuleScript)
+
 local localPlayer = Players.LocalPlayer
 
 type CombatAction = InputBuffer.CombatAction
@@ -404,6 +415,19 @@ else
 
 		Hitstop.Apply(AttackConfig.PARRY_HITSTOP_DURATION)
 
+		--[[
+			Day 7 · Part 2/2: the two senses the hitstop does not cover.
+
+			The clang and the punch go out *after* the freeze is scheduled, so the
+			50ms of held time and the flash of sound land together rather than the
+			sound arriving on a body that has not stopped yet. The punch is applied
+			only on this path — the defender's own event — because a zoom is a reward
+			and the player who was parried did not earn one (their side gets the
+			clang, below).
+		]]
+		DeflectFeedback.Clang()
+		DeflectFeedback.Punch()
+
 		CombatStateBus.FireParryResult({
 			WindowSeconds = reported,
 			ReflectedPosture = math.max(reflectedPosture, 0),
@@ -447,6 +471,17 @@ else
 		CombatStateBus.ResetComboChain()
 
 		Hitstop.Apply(hitstopDuration)
+
+		--[[
+			Day 7 · Part 2/2: the attacker hears the clash too.
+
+			Both blades were in the attacker's hands (one of them, at least) and both
+			are a foot from their camera, so a deflect that only the defender could
+			hear would make the single most punishing moment in the game silent for
+			the player it punished. No FOV punch here: the zoom belongs to the player
+			who won the exchange.
+		]]
+		DeflectFeedback.Clang()
 
 		print(string.format(
 			"[PARRY] %s had their chain broken by a deflect (+%d posture reflected).",

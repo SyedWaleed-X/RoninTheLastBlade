@@ -210,6 +210,8 @@ local GUARD_RELEASE_DURATION = 0.18
 local guardBlend: NumberValue? = nil
 local guardRightShoulder: Motor6D? = nil
 local guardLeftShoulder: Motor6D? = nil
+local guardRightElbow: Motor6D? = nil
+local guardLeftElbow: Motor6D? = nil
 local guardRightRest: CFrame? = nil
 local guardLeftRest: CFrame? = nil
 local guardTween: Tween? = nil
@@ -243,25 +245,77 @@ local guardBlendValue = 0
 	The legs are deliberately *not* touched, so the character keeps walking normally
 	and only the upper body locks — which is the whole intent of the feature.
 
-	Why `PreSimulation` and not `PreAnimation`
-	------------------------------------------
-	The brief suggested `PreAnimation`, and it is the intuitive choice, but it does
-	not work: the engine runs the animation step *after* `PreAnimation` fires, so the
-	Animator overwrites whatever this wrote in the same frame and the lock is
-	invisible. The Motor6D docs are explicit that `Transform` "can be set manually
-	using RunService.PreSimulation", and that is the point in the frame where the
-	animation has finished and the simulation has not — the last moment at which a
-	manual transform is still the one the physics step will read. Written there, the
-	guard holds; written in `PreAnimation`, it does not.
+	Day 7 · Part 1/2 locked the two shoulders. Part 2/2 locks four joints and writes
+	from two hooks, because a report of "the arms still sway while guard-walking"
+	after Part 1/2 was two separate leaks:
 
-	Both shoulders are written and neither is skipped, for the same reason both are
-	written in `applyGuardBlend`: there is no frame on which one arm is locked and the
-	other is not.
+	  * **The elbow is a joint too.** The R15 walk cycle drives
+	    `RightShoulder`/`LeftShoulder` *and* `RightElbow`/`LeftElbow`. Zeroing the
+	    shoulders alone left the forearms pumping under a locked upper arm, and a
+	    forearm is most of what you see in first person and most of the silhouette
+	    in third. All four are now cancelled, so the whole arm from torso to palm
+	    sits at exactly the composed `C0`.
+
+	  * **Simulation is not the last word before the draw.** The docs place the
+	    animation's own write between `PreAnimation` and `PreSimulation`, and add
+	    that `AnimationConstraint` transforms are "not applied immediately, but
+	    rather as a batch in a parallel job after `PreSimulation`, immediately
+	    before physics steps". So `PreSimulation` is where a manual transform is
+	    still the one that gets applied - which is why the original lock lives there
+	    and stays there. What it does *not* guarantee is the frame that is drawn, and
+	    `PreRender` is documented as exactly that hook ("last-minute adjustments such
+	    as changing object positions, updating animations"). The lock therefore runs
+	    in both: `PreSimulation` writes the transform this frame's batch will apply,
+	    `PreRender` re-asserts the same identity as the last word before the draw.
+	    Both write the same constant, so this is one assertion made twice, not two
+	    drivers fighting over a joint - there is no tween, no blend and no state on
+	    this path.
+
+	The values are read once into locals per frame rather than per joint, and the
+	`Parent` test is kept: a `Transform` write on a destroyed joint is an error
+	rather than a no-op, and this runs every frame of a guard on a character that
+	may be dying underneath it.
+
+	Four joints per frame, on two hooks, only while the guard is actually up. That
+	is the entire cost, and it is the price of a stance that holds still.
 ]]
 local locomotionLockConnection: RBXScriptConnection? = nil
+local locomotionLockRenderConnection: RBXScriptConnection? = nil
 
 local function setGuardBlendValue(value: number)
 	guardBlendValue = value
+end
+
+--[[
+	One pass: cancel the animation's contribution to all four arm joints.
+
+	`CFrame.identity` is not a pose, it is the *absence* of one - the joint is left
+	sitting at exactly the `C0` this module composed, which is the guard. Nothing is
+	skipped on a frame where one joint is missing: a rig without elbows still gets
+	its shoulders locked, and vice versa, so a partial rig degrades to a partial
+	lock rather than to no lock at all.
+]]
+local function applyLocomotionLock()
+	local rightShoulder = guardRightShoulder
+	local leftShoulder = guardLeftShoulder
+	local rightElbow = guardRightElbow
+	local leftElbow = guardLeftElbow
+
+	if rightShoulder ~= nil and rightShoulder.Parent ~= nil then
+		rightShoulder.Transform = CFrame.identity
+	end
+
+	if leftShoulder ~= nil and leftShoulder.Parent ~= nil then
+		leftShoulder.Transform = CFrame.identity
+	end
+
+	if rightElbow ~= nil and rightElbow.Parent ~= nil then
+		rightElbow.Transform = CFrame.identity
+	end
+
+	if leftElbow ~= nil and leftElbow.Parent ~= nil then
+		leftElbow.Transform = CFrame.identity
+	end
 end
 
 --[[
@@ -275,6 +329,10 @@ end
 	`guardBlend` being non-nil is not enough on its own: the blend object outlives
 	the instant value write in the tweened path, so between "release requested" and
 	"blend reached 0" the connection is live with a blend approaching zero.
+
+	Two connections, one body: `PreSimulation` for the pose physics reads,
+	`PreRender` for the pose the frame draws. See the note above the state for why
+	both are needed and why writing the same constant twice is not a conflict.
 ]]
 local function startLocomotionLock()
 	if locomotionLockConnection ~= nil then
@@ -286,25 +344,39 @@ local function startLocomotionLock()
 			return
 		end
 
-		local right = guardRightShoulder
-		local left = guardLeftShoulder
+		applyLocomotionLock()
+	end)
 
-		if right ~= nil and right.Parent ~= nil then
-			right.Transform = CFrame.identity
+	locomotionLockRenderConnection = RunService.PreRender:Connect(function()
+		if guardBlendValue <= 0.01 then
+			return
 		end
 
-		if left ~= nil and left.Parent ~= nil then
-			left.Transform = CFrame.identity
-		end
+		applyLocomotionLock()
 	end)
 end
 
+--[[
+	Removes both hooks.
+
+	Each is nil-tested separately rather than assuming they were armed together: a
+	firing order that left `PreRender` connected while `PreSimulation` had already
+	been dropped is the case that leaves a guard pose frozen forever, and the two
+	guards below are what make that impossible.
+]]
 local function stopLocomotionLock()
-	local connection = locomotionLockConnection
+	local simulationConnection = locomotionLockConnection
 	locomotionLockConnection = nil
 
-	if connection ~= nil then
-		connection:Disconnect()
+	if simulationConnection ~= nil then
+		simulationConnection:Disconnect()
+	end
+
+	local renderConnection = locomotionLockRenderConnection
+	locomotionLockRenderConnection = nil
+
+	if renderConnection ~= nil then
+		renderConnection:Disconnect()
 	end
 end
 
@@ -767,9 +839,42 @@ local function equip(character: Model)
 		guardRightRest = rightJoint.C0
 		guardLeftRest = leftJoint.C0
 		guardRestWalkSpeed = nil
+
+		--[[
+			Day 7 · Part 2/2: the elbows join the lock.
+
+			A joint is named after the limb it moves and parented to *that* limb, so
+			the `RightElbow` that swings the forearm lives on `RightLowerArm` - one
+			level below the shoulder joint. Looking for it on the upper arm would
+			find nothing and silently leave the forearms unlocked, which is exactly
+			the leak this part exists to close.
+
+			They are captured *beside* the shoulders rather than as part of the gate:
+			the guard pose is defined by the two shoulders, so a rig that somehow
+			had shoulders without elbows should still raise a guard - just one whose
+			forearms keep their locomotion. Their absence degrades the lock, it does
+			not remove it.
+		]]
+		local rightLowerArm = character:FindFirstChild("RightLowerArm")
+		local leftLowerArm = character:FindFirstChild("LeftLowerArm")
+		local rightElbowJoint = if rightLowerArm then rightLowerArm:FindFirstChild("RightElbow") else nil
+		local leftElbowJoint = if leftLowerArm then leftLowerArm:FindFirstChild("LeftElbow") else nil
+
+		guardRightElbow = nil
+		guardLeftElbow = nil
+
+		if rightElbowJoint and rightElbowJoint:IsA("Motor6D") then
+			guardRightElbow = rightElbowJoint
+		end
+
+		if leftElbowJoint and leftElbowJoint:IsA("Motor6D") then
+			guardLeftElbow = leftElbowJoint
+		end
 	else
 		guardRightShoulder = nil
 		guardLeftShoulder = nil
+		guardRightElbow = nil
+		guardLeftElbow = nil
 		guardRightRest = nil
 		guardLeftRest = nil
 
@@ -862,6 +967,23 @@ local function unequip()
 		survives a respawn and writes into a torn-down rig forever.
 	]]
 	stopLocomotionLock()
+
+	--[[
+		Day 7 · Part 2/2: drop the four joints as well as the hooks that wrote them.
+
+		With both connections gone the references are already inert, so this is not
+		a fix for a live bug - it is the same rule the blade rig and the guard handle
+		follow: a module that has just been unequipped should hold no reference to
+		the character it was unequipped from. The next `equip` overwrites all four
+		anyway; nilling them here is what makes "this module is attached to nothing"
+		literally true rather than merely true in effect.
+	]]
+	guardRightShoulder = nil
+	guardLeftShoulder = nil
+	guardRightElbow = nil
+	guardLeftElbow = nil
+	guardRightRest = nil
+	guardLeftRest = nil
 
 	activeRig = nil
 	activeCharacter = nil

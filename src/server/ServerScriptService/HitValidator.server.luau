@@ -92,7 +92,16 @@ local PARRY_HITSTOP_DURATION = AttackConfig.PARRY_HITSTOP_DURATION
 	has no window here at all, and one that lies about pressing only ever edits a
 	local value that never travels upward.
 ]]
-local PARRY_STATE_ATTRIBUTE = "RoninParryUntil"
+--[[
+	Read from `AttackConfig` rather than written here as of Day 7 · Part 2/2.
+
+	The name moved because the sparring dummy now reads this attribute too, and it
+	is the only thing that decides whether a dummy's strike is deflected. Two
+	spellings of one attribute name would fail silently in the worst possible
+	direction: the player would hold a perfect parry and be hit anyway, with nothing
+	in the console to explain it.
+]]
+local PARRY_STATE_ATTRIBUTE = AttackConfig.PARRY_STATE_ATTRIBUTE
 
 
 --[[

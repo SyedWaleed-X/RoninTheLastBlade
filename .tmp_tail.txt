@@ -1,0 +1,51 @@
+﻿task.spawn(runAttackLoop)
+
+
+
+	The dummy is knocked out of its swing and leans back for `duration`, then returns
+	to rest. This is the visible half of "the attack was cancelled": a swing that
+	simply stopped mid-arc would read as a script error, whereas a body that is
+	shoved backwards reads as *being beaten*, which is the feedback a player who
+	landed a perfect parry has earned.
+
+	The recovery is token-guarded, so a reel that is still resolving when the next
+	attack begins cannot drive the joints back to rest in the middle of that attack's
+	windup.
+]]
+local function stagger(rigHandle: DummyRig, duration: number)
+	cancelTweens()
+
+	local myToken = swingToken
+
+	tweenJoint(rigHandle.Waist, STAGGER_WAIST, 0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	tweenJoint(rigHandle.RightShoulder, CFrame.identity, 0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	tweenJoint(rigHandle.RightElbow, STAGGER_ELBOW, 0.10, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+	task.delay(duration, function()
+		if swingToken ~= myToken then
+			return
+		end
+
+		local current = activeRig
+		if current ~= rigHandle then
+			return
+		end
+
+		poseSwing(
+			current,
+			CFrame.identity,
+			CFrame.identity,
+			CFrame.identity,
+			STRIKE_RETURN_DURATION,
+			Enum.EasingStyle.Sine,
+			Enum.EasingDirection.InOut
+		)
+	end)
+end
+
+
+
+
+	    tween owns that, not this script.
+]]
+

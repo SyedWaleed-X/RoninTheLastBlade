@@ -253,6 +253,23 @@ local PARRY_REFLECT_POSTURE = 25
 local PARRY_HITSTOP_DURATION = 0.05
 
 --[[
+	Day 7 · Part 2/2: the attribute that records "a parry window is open on this
+	character", as an absolute `os.clock()` deadline written by the server.
+
+	It was a private string inside `HitValidator` until this part. It is here now
+	because a *second* server-side attacker reads it: the sparring dummy has to ask
+	"is this defender inside a parry window?" with exactly the question the player
+	path asks, and a second copy of the string is precisely the silent failure this
+	whole file exists to prevent - a dummy that checks a misspelled attribute simply
+	never deflects, with no error anywhere, and the feature looks unimplemented
+	rather than miswired.
+
+	The attribute stays server-written: it is the server's own deadline, so a client
+	editing its local copy changes nothing either attacker reads.
+]]
+local PARRY_STATE_ATTRIBUTE = "RoninParryUntil"
+
+--[[
 	Day 7 · Part 1/2: the three remotes the parry needs, and why each has the
 	audience it has.
 
@@ -313,6 +330,7 @@ local AttackConfig = table.freeze({
 	PARRY_SPAM_RESET_COOLDOWN = PARRY_SPAM_RESET_COOLDOWN,
 	PARRY_REFLECT_POSTURE = PARRY_REFLECT_POSTURE,
 	PARRY_HITSTOP_DURATION = PARRY_HITSTOP_DURATION,
+	PARRY_STATE_ATTRIBUTE = PARRY_STATE_ATTRIBUTE,
 	REMOTE_PARRY_RESULT_EVENT = REMOTE_PARRY_RESULT_EVENT,
 	REMOTE_COMBO_BREAK_EVENT = REMOTE_COMBO_BREAK_EVENT,
 	REMOTE_DEFLECT_CLASH_EVENT = REMOTE_DEFLECT_CLASH_EVENT,
