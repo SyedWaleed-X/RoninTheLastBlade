@@ -111,7 +111,24 @@ local function dispatchAction(action: CombatAction): boolean
 		return CombatStateBus.RequestState("Blocking")
 	end
 
-	-- Dodge and Execute are bound and queued but have no transition wired up yet.
+	--[[
+		Day 9 · Part 1/2: `Dodge` has no branch here, and that is deliberate.
+
+		The dodge is spent by `InputBinder` calling `CombatStateBus.RunDodge()`
+		directly, before `OfferIntent` is ever reached, because a queued dodge
+		could not do the two things the move exists for (cancel a `Windup`, cancel
+		a `Recovery`) and because routing it here made the binder print
+		"[INPUT BUFFER] Queued: Dodge" for a press that had been refused outright.
+
+		Leaving a `Dodge` branch in this mapping as well would create a *second*
+		way to spend the same press, reachable only by a buffer entry that nothing
+		can now create - dead code that a future edit would read as live. One press,
+		one entry point, one trace.
+
+		`Execute` is bound and queued but has no transition wired up yet; unlike
+		the dodge it has no move of its own to own, so it is still a buffered
+		intent and belongs here.
+	]]
 	return false
 end
 
@@ -136,6 +153,20 @@ end
 	    latency" for a direct press really is zero.
 ]]
 local function offerIntent(action: CombatAction): boolean
+	--[[
+		Day 9 · Part 1/2: a dodge never reaches this function.
+
+		It is spent by `InputBinder` calling `CombatStateBus.RunDodge()` directly
+		(see the `Dodge` branch there). A dodge has to be spendable out of
+		`Windup` and `Recovery`, and the gate below only spends when the machine
+		is already Idle - so a dodge routed through here would have been queued in
+		exactly the two states the move exists to cancel out of.
+
+		That is also why there is no `Dodge` check in this function: one press,
+		one entry point. A second check here would be reachable only by a buffer
+		entry nothing can now create, and would read as live code to the next
+		editor.
+	]]
 	InputBuffer.Clear()
 
 	local machine = CombatStateBus.GetActiveMachine()

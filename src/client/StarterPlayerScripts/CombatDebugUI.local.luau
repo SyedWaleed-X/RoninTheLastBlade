@@ -38,6 +38,13 @@ local STATE_COLORS: { [CombatState]: Color3 } = {
 	Parrying = Color3.fromRGB(54, 206, 214), -- cyan
 	Stunned = Color3.fromRGB(154, 88, 216), -- purple
 	Executing = Color3.fromRGB(186, 24, 66), -- crimson
+	-- Day 9 P1/2: Dodging is deliberately the *only* state drawn in the same
+	-- cyan the parry uses, because those are the two answers to the same question
+	-- - "I am reading this attack and reacting to it". It is also a state whose
+	-- first 200ms are safe and whose last 150ms are not, so the badge colour is
+	-- not enough on its own; the dedicated DODGE row below is what names the
+	-- phase.
+	Dodging = Color3.fromRGB(86, 196, 255), -- ice blue
 }
 
 local NEUTRAL_COLOR = Color3.fromRGB(52, 54, 62)
@@ -203,7 +210,10 @@ card.BackgroundColor3 = CARD_BACKGROUND
 card.BackgroundTransparency = 0.05
 card.BorderSizePixel = 0
 card.Position = UDim2.fromOffset(16, 16)
-card.Size = UDim2.fromOffset(CARD_WIDTH, 234)
+-- Day 9 P1/2: 234 -> 250, for the added dodge row plus its 16px of divider/feed
+-- shift. The input telemetry card below is moved by the same 16px so the two
+-- cards do not overlap.
+card.Size = UDim2.fromOffset(CARD_WIDTH, 250)
 card.Parent = screenGui
 
 local cardStroke = Instance.new("UIStroke")
@@ -330,18 +340,108 @@ CombatStateBus.SubscribeParryResults(function(record: CombatStateBus.ParryResult
 	paintParryResult()
 end)
 
+--[[
+	Day 9 · Part 1/2: the dodge phase row.
+
+	Sits directly beneath the parry row and reads `DODGE: [ I-FRAMES ]` while the
+	server is honouring the dodge, `DODGE: [ RECOVERY ]` once it is not, and
+	`DODGE: [ — ]` otherwise.
+
+	The reason this is a *row* and not just a state badge is that "DODGING" is the
+	least useful thing this HUD could say about a dodge. The whole design of the
+	move is the 200/150 split - there is a window where a hit does nothing, and a
+	window where it does everything - so a single badge that says `DODGING` for
+	350ms actively hides the one piece of information the player needs. The row
+	also carries the direction and the source (`MOVE` / `BACKSTEP`) and the speed,
+	which is what makes the backstep fallback visible: a player who pressed Q
+	believing they were side-stepping and read `BACKSTEP` learns that the input was
+	not registered, which is otherwise indistinguishable from the backstep simply
+	being wrong.
+
+	Expiry is a compared deadline read in the render loop rather than a `task.delay`
+	that clears the row, for exactly the reason the parry flash above does it: two
+	dodges inside one display window would otherwise have the first one's timer
+	wipe the second one's phase, and a timer aimed at a label a HUD rebuild has
+	already destroyed is a timer that errors. See `paintDodgeRow`.
+]]
+local dodgeLabel = createLabel(
+	card, "DodgePhase", "DODGE: [ — ]", 13, Enum.Font.GothamBold, TEXT_DIM,
+	UDim2.fromOffset(0, 114), UDim2.new(1, 0, 0, 16)
+)
+
+--[[
+	The two phase colours, and why they are *not* both the state colour.
+
+	`I-Frames` is the safe window and is drawn in the bright cyan, the same tone
+	the parry success line uses: both mean "you read this correctly and the game
+	is protecting you". `Recovery` is drawn in the attacker's red, because that is
+	what the window is - the player is now standing in a 150ms hole with no
+	i-frames, and colouring it cyan would tell them they are safe at the exact
+	moment they are not. The transition between the two is the entire feedback
+	the row exists to deliver.
+]]
+local DODGE_IFRAME_COLOR = Color3.fromRGB(86, 214, 255)
+local DODGE_RECOVERY_COLOR = Color3.fromRGB(232, 96, 72)
+
+--[[
+	Paints the dodge row from the controller's published telemetry, or dims it when
+	there is nothing to report or the reported window has already closed.
+
+	Read from the bus rather than from a subscription, because the row shows a
+	*current value* ("which phase am I in right now") and not an event stream. A
+	notification that arrived while no character was bound would otherwise leave a
+	row showing a phase for a dodge belonging to a body that no longer exists.
+]]
+local function paintDodgeRow()
+	local telemetry = CombatStateBus.GetDodgeTelemetry()
+
+	if telemetry == nil or os.clock() >= telemetry.EndsAt then
+		if telemetry ~= nil then
+			-- Expired on its own. Cleared here rather than by a timer so the bus
+			-- and the HUD cannot disagree about whether a dodge is live.
+			CombatStateBus.ClearDodgeTelemetry()
+		end
+
+		dodgeLabel.Text = "DODGE: [ — ]"
+		dodgeLabel.TextColor3 = TEXT_DIM
+		return
+	end
+
+	local remainingMs = math.floor((telemetry.EndsAt - os.clock()) * 1000)
+
+	if telemetry.Phase == "IFrames" then
+		dodgeLabel.Text = string.format(
+			"DODGE: [ I-FRAMES %dms · %s %.0f st/s ]",
+			remainingMs,
+			tostring(telemetry.Origin):upper(),
+			telemetry.Speed
+		)
+		dodgeLabel.TextColor3 = DODGE_IFRAME_COLOR
+	else
+		dodgeLabel.Text = string.format("DODGE: [ RECOVERY %dms ]", remainingMs)
+		dodgeLabel.TextColor3 = DODGE_RECOVERY_COLOR
+	end
+end
+
+--[[
+	The dodge row above pushed the divider and the transition feed down 16px, and
+	the card grew to match. Both are hard-coded offsets rather than a layout
+	container, so the shift is a set of numbers that have to agree with each other:
+	the divider at 134, the feed title at 142 and the four rows at 158 + 14 each
+	now end at 214, inside the new 250px card with its 12px bottom padding.
+]]
 local divider = Instance.new("Frame")
 divider.Name = "Divider"
 divider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 divider.BackgroundTransparency = 0.85
 divider.BorderSizePixel = 0
-divider.Position = UDim2.new(0, 0, 0, 118)
+divider.Position = UDim2.new(0, 0, 0, 134)
 divider.Size = UDim2.new(1, 0, 0, 1)
 divider.Parent = card
 
 local feedTitleLabel = createLabel(
 	card, "FeedTitle", "TRANSITIONS", 10, Enum.Font.GothamBold, TEXT_DIM,
-	UDim2.fromOffset(0, 126), UDim2.new(1, 0, 0, 12)
+	UDim2.fromOffset(0, 142), UDim2.new(1, 0, 0, 12)
 )
 
 -- Four rows, newest first; filled in by pushHistory.
@@ -349,7 +449,7 @@ local feedRows: { TextLabel } = {}
 for index = 1, HISTORY_DEPTH do
 	local row = createLabel(
 		card, "FeedRow" .. index, "", 11, Enum.Font.Code, TEXT_BRIGHT,
-		UDim2.fromOffset(0, 142 + (index - 1) * 14), UDim2.new(1, 0, 0, 14)
+		UDim2.fromOffset(0, 158 + (index - 1) * 14), UDim2.new(1, 0, 0, 14)
 	)
 	feedRows[index] = row
 end
@@ -364,7 +464,7 @@ inputCard.Name = "InputTelemetryCard"
 inputCard.BackgroundColor3 = CARD_BACKGROUND
 inputCard.BackgroundTransparency = 0.05
 inputCard.BorderSizePixel = 0
-inputCard.Position = UDim2.fromOffset(16, 258)
+inputCard.Position = UDim2.fromOffset(16, 274)
 inputCard.Size = UDim2.fromOffset(CARD_WIDTH, 172)
 inputCard.Parent = screenGui
 
@@ -1020,6 +1120,22 @@ RunService.RenderStepped:Connect(function()
 	]]
 	paintParryResult()
 
+	--[[
+		Day 9 P1/2: the dodge row, serviced from the same render loop.
+
+		Placed beside `paintParryResult` and for the same reason: both show a
+		window that expires on a deadline, and a `task.delay` that cleared either
+		label would race the next one - two dodges inside one display window would
+		have the first one's timer wipe the second one's phase.
+
+		It is called *unconditionally*, above the `if not machine` early-out. The
+		early-out is right for the state rows, which genuinely need a machine, but
+		a dodge can be in flight against a character whose machine has just been
+		retired, and a row that cleared itself at that instant would be reporting
+		the HUD's bookkeeping rather than the dodge.
+	]]
+	paintDodgeRow()
+
 	-- Update Input Telemetry panel (zero per-frame table allocations)
 	local pendingAction = InputBuffer.Peek()
 	local timeRemainingMs = InputBuffer.GetTimeRemaining()
@@ -1076,6 +1192,12 @@ local KEY_SEQUENCES: { [Enum.KeyCode]: { CombatState } } = {
 	[Enum.KeyCode.Two] = { "Blocking" },
 	[Enum.KeyCode.Three] = { "Parrying" },
 	[Enum.KeyCode.Four] = { "Stunned" },
+	-- Day 9 P1/2. Forcing the state by hand is the only way to see what the
+	-- badge and the divider look like mid-dodge, since a real dodge resolves in
+	-- 350ms and the harness only gets a keypress. It moves the *machine* only -
+	-- no LinearVelocity is created and no i-frames are requested, so this cannot
+	-- be mistaken for a dodge that happened.
+	[Enum.KeyCode.Five] = { "Dodging" },
 }
 
 --[[
@@ -1091,7 +1213,17 @@ local function runChaosTest()
 		return
 	end
 
-	local states: { CombatState } = { "Idle", "Windup", "Active", "Recovery", "Blocking", "Parrying", "Stunned", "Executing" }
+	--[[
+		Day 9 P1/2: `Dodging` joins the burst list.
+
+		Every legal state is included, and the new one is no exception: the point
+		of the burst is to prove `SetState` stays coherent under re-entrant load
+		across the *whole* table, and a state the burst never touches is a state
+		whose edges are never exercised. `Dodging` in particular has an edge into
+		`Stunned` and one out to `Idle`, and this is the only thing that will ever
+		request them out of order.
+	]]
+	local states: { CombatState } = { "Idle", "Windup", "Active", "Recovery", "Blocking", "Parrying", "Stunned", "Executing", "Dodging" }
 	local accepted = 0
 	local rejected = 0
 	local failure: string? = nil

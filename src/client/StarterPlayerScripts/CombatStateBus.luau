@@ -49,6 +49,37 @@ export type LightAttackExecutor = () -> boolean
 export type ActionIntake = (action: CombatAction) -> boolean
 
 --[[
+	Day 9 · Part 1/2: the two phases of a dodge, as the HUD reports them.
+
+	`DodgePhase` is a closed union rather than a free string because the HUD
+	switches on it and `--!strict` then proves both halves are handled; a typo
+	would otherwise be a silently dark row in the debug card.
+
+	`IFrames` is the window the *server* is honouring - the defender cannot be
+	hit at all. `Recovery` is the tail where they are fully vulnerable again but
+	the move has not finished. The distinction is the entire point of the dodge,
+	so the HUD shows which of the two a player is currently standing in rather
+	than a single "DODGING" that would hide the moment the safety went off.
+]]
+export type DodgePhase = "IFrames" | "Recovery"
+
+--[[
+	One dodge in flight, published to the HUD.
+
+	`EndsAt` is this client's `os.clock()` deadline rather than a count-down the
+	HUD decrements, for the same reason the parry flash is a deadline: two dodges
+	inside one flash window would otherwise have the first one's timer clear the
+	second one's line. A compared absolute cannot be stale.
+]]
+export type DodgeTelemetry = {
+	Phase: DodgePhase,
+	EndsAt: number,
+	Direction: Vector3,
+	Speed: number,
+	Origin: CombatState,
+}
+
+--[[
 	Day 5 · Part 1/2: the client-local katana proxy published by WeaponVisuals.
 
 	WeaponVisuals is a LocalScript (Script Sync `.local.luau` suffix) and `require`
@@ -410,6 +441,67 @@ end
 ]]
 function bus.SetLightAttackExecutor(executor: LightAttackExecutor?)
 	lightAttackExecutor = executor
+end
+
+--[[
+	Day 9 · Part 1/2: the dodge telemetry seam.
+
+	`DodgeController` is a LocalScript and the HUD is a LocalScript, so neither
+	can `require` the other. They meet here, for the same reason the guard and the
+	parry meet here: the bus is the one place both can reach.
+]]
+local dodgeTelemetry: DodgeTelemetry? = nil
+
+function bus.SetDodgeTelemetry(telemetry: DodgeTelemetry?)
+	dodgeTelemetry = telemetry
+end
+
+function bus.GetDodgeTelemetry(): DodgeTelemetry?
+	return dodgeTelemetry
+end
+
+--[[
+	Day 9 · Part 1/2: the dodge driver seam.
+
+	`DodgeController` is a LocalScript (Script Sync suffix `.local.luau`) and
+	`require` only works on ModuleScripts, so the [Q] action cannot reach it
+	directly. It is registered here instead, for the same reason and with the same
+	shape as `SetLightAttackExecutor` above: one registration, one caller, and a
+	warned failure if the driver never arrived.
+]]
+local dodgeExecutor: (() -> boolean)? = nil
+
+function bus.SetDodgeExecutor(executor: (() -> boolean)?)
+	dodgeExecutor = executor
+end
+
+--[[
+	Runs the registered dodge driver, returning whether a dodge started.
+
+	False means either "refused, and here is the trace saying why" - which is an
+	ordinary outcome and is reported as such by the caller - or, if nothing is
+	registered at all, a real wiring fault. That case warns rather than returning
+	silently, because otherwise a [Q] press that does nothing would have no cause
+	anywhere in the output: the machine's transition rules would never even be
+	asked, so the StateMachine would have nothing to complain about either.
+]]
+function bus.RunDodge(): boolean
+	local executor = dodgeExecutor
+	if executor == nil then
+		warn("[COMBAT] RunDodge: no executor registered (is DodgeController running?).")
+		return false
+	end
+
+	return executor()
+end
+
+--[[
+	Clears the dodge row. Called by the controller on teardown and by the HUD
+	itself when the reported deadline has passed, so a dodge that resolves while
+	no character is bound still cannot leave a lit row behind.
+]]
+function bus.ClearDodgeTelemetry()
+	dodgeTelemetry = nil
 end
 
 --[[

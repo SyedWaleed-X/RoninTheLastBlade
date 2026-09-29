@@ -440,6 +440,200 @@ local REMOTE_DEFLECT_CLASH_EVENT = "DeflectClashEvent"
 ]]
 local REMOTE_CHAOS_EVENT = "ChaosTestEvent"
 
+--[[
+	Day 9 · Part 1/2: the step-dodge, and the i-frames it buys.
+
+	Everything about the dodge is named here rather than written into the two
+	scripts that need it, for the same reason as every other name in this file:
+	two copies of a number which disagree fail *silently*, and a dodge is the
+	worst possible place for that failure, because the two sides would disagree
+	about whether a hit landed at all.
+
+	    0.000s  dodge begins. The 200ms i-frame window opens.
+	    0.200s  i-frames close. Vulnerable for the rest of the move.
+	    0.350s  the state ends, back to Idle.
+
+	The 200ms / 350ms split is the whole design, and it is a deliberate
+	asymmetry:
+
+	  * The i-frames are SHORTER than Hit 1's 0.27s Windup+Active. A dodge that
+	    outlasted a light swing would be a strictly better answer to a light
+	    attack than a parry, and it costs nothing, so nobody would ever learn to
+	    time the 133ms window the parry exists to teach. At 200ms the dodge
+	    reliably beats an attack that is *already swinging* and reliably loses to
+	    one the player saw start - which is exactly the read it should reward.
+	  * The 150ms of recovery after them is what stops it being free. A dodge
+	    that ended the moment its i-frames did would be a panic button with no
+	    downside; ending it 150ms later means dodging at the wrong time leaves
+	    you open inside the opponent's next windup.
+
+	`DODGE_SPEED` (45 studs/s) is roughly 2.8x a normal walk and lands the body
+	about 7.9 studs downrange over the 0.175s the push is actually held - about
+	one and a half character widths. Long enough to visibly leave the sword's
+	reach, short enough that it reads as a step rather than a teleport, and
+	short enough that a missed dodge is still recoverable by walking.
+
+	`DODGE_MAX_AXES_FORCE` is a force *ceiling*, not a target, and the Y entry of
+	zero is the load-bearing number. `VectorVelocity` asks the constraint to
+	hold the body at 45 studs/s; `MaxAxesForce` caps how hard it may push to get
+	there. X/Z of 50000 is far more than enough to accelerate a character of this
+	mass inside 200ms, and Y of 0 means the constraint applies *no vertical force
+	whatsoever* - so gravity keeps its full authority and a character brushing a
+	wall cannot be launched up it. The classic dash bug (infinite MaxForce, no
+	Y clamp) is a character fired into the sky by a railing; this is the fix for
+	it, and it is why the ceiling is set explicitly rather than left at its
+	default of unlimited.
+
+	`DODGE_COOLDOWN` is the server's half of the anti-chain rule. The transition
+	table already refuses `Dodging -> Dodging`, but that table lives in the
+	*dodger's own client process* (ARCHITECTURE.md #3), so on its own it stops
+	nothing: an exploiter can simply fire the remote again and ask for the
+	attribute a second time. The server measures the gap between requests itself
+	and refuses one that arrives inside the cooldown, which is the only version
+	of the rule a cheater cannot route around.
+]]
+local REMOTE_DODGE_EVENT = "DodgeEvent"
+local INVULNERABLE_ATTRIBUTE = "RoninInvulnerable"
+local DODGE_IFRAME_DURATION = 0.20
+local DODGE_TOTAL_DURATION = 0.35
+local DODGE_RECOVERY_DURATION = DODGE_TOTAL_DURATION - DODGE_IFRAME_DURATION
+local DODGE_SPEED = 45
+local DODGE_MAX_AXES_FORCE = Vector3.new(50000, 0, 50000)
+local DODGE_COOLDOWN = 0.50
+
+--[[
+	Day 9 · Part 1/2: how far a neutral dodge reaches before it commits to the
+	"no input" backstep.
+
+	`Humanoid.MoveDirection` is a magnitude between 0 and 1, and it is already
+	camera-relative - the default control module builds it in camera space, so
+	pressing W while looking at a wall walks you *into* that wall. Reading it
+	directly is therefore the whole of "dodge where I am walking", with no
+	camera maths of our own to get wrong.
+
+	The threshold is 0.1 rather than 0 because of how a keyboard actually
+	reports. A player who taps a direction key and immediately taps Q produces a
+	`MoveDirection` well below 1, and a `> 0` test would read that as neutral and
+	backstep them out of a dodge they clearly meant to throw forwards. 0.1 is
+	below anything a deliberate press produces and above the noise a key release
+	leaves behind for a frame or two, so it separates "I am going somewhere" from
+	"I have stopped" without needing to sample the input twice.
+
+	`DODGE_BACKSTEP_DISTANCE` is how far ahead the neutral backstep looks for a
+	wall before it commits. Without it, backstepping into a wall produces a
+	dodge that travels nowhere and still costs 350ms of vulnerability, which is
+	the worst possible outcome for the player - they paid full price for a move
+	that did not happen. 9 studs is a little under the 14-stud `MAX_HIT_DISTANCE`
+	ceiling, so a dodger pressed against a wall still clears a blade aimed at
+	them rather than being pinned in place inside its reach.
+]]
+local DODGE_MOVE_DEADZONE = 0.1
+local DODGE_BACKSTEP_DISTANCE = 9
+--[[
+	Day 9 · Part 2/2: the procedural dash lean.
+
+	A `LinearVelocity` moves a character without moving its *pose*. The root moves
+	at 45 studs/s while the legs keep their idle cycle, so the result reads as a
+	skate: the body slides out from under itself and nothing about the silhouette
+	says "evasion". The lean is the cheapest fix and the only one that needs no
+	animation asset - tilt the torso joint along the dash and the slide becomes a
+	step.
+
+	`DODGE_LEAN_JOINT` is the R15 `Root` Motor6D, which joins `HumanoidRootPart`
+	to `LowerTorso`. That is the correct joint for this: rotating its `C0` swings
+	the *upper body* around the pelvis, which is what a real dodge lean is. Tilting
+	`LowerTorso.RootJoint` instead would pivot the whole body including the legs and
+	read as the character falling sideways.
+
+	`C0` and not `Transform`. `Transform` is the batched property the Animator
+	writes, and the engine applies it in a parallel job after `PreSimulation`;
+	`C0` is the immediate, non-Animator path. A character with an `Animator` loaded
+	(sliding, running, the default idle) has its joints driven through `Transform`,
+	so a `C0` overlay is the only one of the two that survives the next animation
+	event instead of being overwritten by it. `C0` is also not deprecated - the docs
+	recommend `Transform` *for animating rigged models*, which is not what a
+	200ms procedural overlay is.
+
+	25 degrees forward and 20 degrees of bank. The two are different numbers on
+	purpose: a forward dodge is a committed slip and carries the whole body, while
+	a lateral slide is a footwork step that banks without pitching. Pitching a
+	lateral dodge 25 degrees reads as a stumble, and banking a forward dodge 20
+	degrees reads as a crab-walk.
+
+	The pitch is a slight *dip* of the torso rather than a pure hinge - the joint
+	is translated down by `DODGE_LEAN_TORSO_DROP` studs as well as rotated, so the
+	head leads and the hips trail. Rotation alone about a joint near the waist
+	pivots the upper body in place, which is a mannequin falling sideways; dropping
+	the shoulder line while it turns is what makes it read as weight.
+]]
+local DODGE_LEAN_JOINT = "Root"
+local DODGE_LEAN_FORWARD_DEG = 25
+local DODGE_LEAN_BACKWARD_DEG = 14
+local DODGE_LEAN_BANK_DEG = 20
+local DODGE_LEAN_TORSO_DROP = 0.45
+
+--[[
+	The lean is held for the i-frame window and released into the recovery tail,
+	so the return tween overlaps the vulnerable 150ms rather than finishing with
+	it. Releasing at `DODGE_IFRAME_DURATION` for a `DODGE_LEAN_RETURN_DURATION`
+	return means the torso is back to neutral just as the dodge resolves to Idle -
+	a character that snapped upright a frame before going vulnerable would read as
+	recovering its balance *while* unable to be touched.
+
+	Slow in, fast out is the opposite of the usual easing choice and is deliberate:
+	the snap into the lean has to be sharp enough to register as a reaction inside
+	200ms, and the return is an uncoiling that should not outlast the move.
+]]
+local DODGE_LEAN_TWEEN_IN = 0.06
+local DODGE_LEAN_RETURN_DURATION = 0.12
+
+--[[
+	Day 9 · Part 2/2: the dodge's cost in posture.
+
+	The dodge was free. Everything else in the combat vocabulary spends posture -
+	a block does, a deflect does, and a whiffed guard has to climb back out of the
+	red - so a player who discovered they could press Q on reaction would simply
+	never have to engage with the posture economy at all, and every deliberate
+	choice in COMBAT_SPEC §3 would be answered with the same key. A move that is
+	strictly better than every other answer, for free, is not a tactical option.
+
+	`DODGE_POSTURE_COST` is 10 against a 100-point pool with a 1.2s recovery grace
+	and 16/sec of healthy regen, so a single deliberate dodge is roughly 0.6s of
+	standing still to repay. That is the price of the answer to an attack already
+	in the air, and it is small enough that a player who dodges correctly still
+	comes out ahead. It is large enough that dodging *every* swing does not work:
+	at Hit 1's 0.27s cadence, ten posture per dodge is ~37/sec of spend against
+	16/sec of regen, and the pool empties.
+
+	`DODGE_SPAM_WINDOW` and `DODGE_SPAM_COST_STEP` are the panic-roll penalty. The
+	base cost already makes spam lose; these make it lose *fast*. A dodge inside
+	`DODGE_SPAM_WINDOW` of the last one costs `DODGE_SPAM_COST_STEP` more than the
+	one before it (10 -> 15 -> 20), so a player mashing Q through a pressure string
+	is broke by their own hands in three presses, while a player spacing their
+	evasions a beat apart is charged the flat rate. The step is a flat increment
+	rather than a multiplier so the penalty stays legible on a HUD: the player can
+	see the cost of each press rise, and learn that spacing is cheaper.
+
+	The chain count is capped at `DODGE_SPAM_MAX_CHAIN` so the per-press cost has a
+	ceiling. An uncapped `10 + 5n` reaches 100 posture in 18 presses and spends
+	most of its life refusing to cast; capping at 25 keeps the punishment steep
+	inside the window while leaving a panic-roller with a dodge they can still
+	throw.
+
+	`DODGE_POSTURE_LOCKOUT` is the escape hatch, and it is what stops the cost from
+	becoming a death sentence. At 90 the dodge is refused outright until posture
+	recoveries take the character back under it. 90 is chosen so that a *single*
+	dodge can never cross the line: 90 + the 25 capped cost is 115, so the lockout
+	is doing real work, but a character at 89 can still throw one last evasive step
+	- the difference between "you are spent" and "you are dead".
+]]
+local DODGE_POSTURE_COST = 10
+local DODGE_SPAM_WINDOW = 0.8
+local DODGE_SPAM_COST_STEP = 5
+local DODGE_SPAM_MAX_CHAIN = 3
+local DODGE_POSTURE_LOCKOUT = 90
+
+
 local MAX_HIT_DISTANCE = 14
 
 --[[
@@ -489,6 +683,28 @@ local AttackConfig = table.freeze({
 	REMOTE_COMBO_BREAK_EVENT = REMOTE_COMBO_BREAK_EVENT,
 	REMOTE_DEFLECT_CLASH_EVENT = REMOTE_DEFLECT_CLASH_EVENT,
 	REMOTE_CHAOS_EVENT = REMOTE_CHAOS_EVENT,
+	REMOTE_DODGE_EVENT = REMOTE_DODGE_EVENT,
+	INVULNERABLE_ATTRIBUTE = INVULNERABLE_ATTRIBUTE,
+	DODGE_IFRAME_DURATION = DODGE_IFRAME_DURATION,
+	DODGE_TOTAL_DURATION = DODGE_TOTAL_DURATION,
+	DODGE_RECOVERY_DURATION = DODGE_RECOVERY_DURATION,
+	DODGE_SPEED = DODGE_SPEED,
+	DODGE_MAX_AXES_FORCE = DODGE_MAX_AXES_FORCE,
+	DODGE_COOLDOWN = DODGE_COOLDOWN,
+	DODGE_MOVE_DEADZONE = DODGE_MOVE_DEADZONE,
+	DODGE_BACKSTEP_DISTANCE = DODGE_BACKSTEP_DISTANCE,
+	DODGE_LEAN_JOINT = DODGE_LEAN_JOINT,
+	DODGE_LEAN_FORWARD_DEG = DODGE_LEAN_FORWARD_DEG,
+	DODGE_LEAN_BACKWARD_DEG = DODGE_LEAN_BACKWARD_DEG,
+	DODGE_LEAN_BANK_DEG = DODGE_LEAN_BANK_DEG,
+	DODGE_LEAN_TORSO_DROP = DODGE_LEAN_TORSO_DROP,
+	DODGE_LEAN_TWEEN_IN = DODGE_LEAN_TWEEN_IN,
+	DODGE_LEAN_RETURN_DURATION = DODGE_LEAN_RETURN_DURATION,
+	DODGE_POSTURE_COST = DODGE_POSTURE_COST,
+	DODGE_SPAM_WINDOW = DODGE_SPAM_WINDOW,
+	DODGE_SPAM_COST_STEP = DODGE_SPAM_COST_STEP,
+	DODGE_SPAM_MAX_CHAIN = DODGE_SPAM_MAX_CHAIN,
+	DODGE_POSTURE_LOCKOUT = DODGE_POSTURE_LOCKOUT,
 	MAX_HIT_DISTANCE = MAX_HIT_DISTANCE,
 	ACTIVE_WINDOW_GRACE = ACTIVE_WINDOW_GRACE,
 })

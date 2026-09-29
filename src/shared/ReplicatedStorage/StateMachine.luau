@@ -28,6 +28,7 @@ local ALLOWED_TRANSITIONS: { [CombatState]: { [CombatState]: boolean } } = {
 		Parrying = true,
 		Stunned = true,
 		Executing = true,
+		Dodging = true,     -- Day 9 P1/2: a dodge out of neutral
 		Idle = false,
 	},
 	Windup = {
@@ -35,19 +36,32 @@ local ALLOWED_TRANSITIONS: { [CombatState]: { [CombatState]: boolean } } = {
 		Parrying = true, -- Can cancel startup into a parry
 		Stunned = true,  -- Hit by opponent
 		Idle = true,     -- Feint cancel
+		Dodging = true,  -- Day 9 P1/2: a dodge is the *other* cancel out of startup
 	},
 	Active = {
 		Recovery = true,
 		Stunned = true,  -- Staggered by an attack/parry
+		-- No Dodging edge on purpose. COMBAT_SPEC §1 calls Active the lethal,
+		-- action-locked, cannot-turn window, and §2.3 says it cannot be interrupted
+		-- except by taking damage. A dodge that could cancel the strike that is
+		-- already live would make Active an optional commitment rather than the
+		-- committed one the whole frame-data chain is built around.
 	},
 	Recovery = {
 		Idle = true,
 		Stunned = true,
+		Dodging = true,  -- Day 9 P1/2: dodge-cancel the follow-through
 	},
 	Blocking = {
 		Idle = true,     -- Releasing block
 		Parrying = true, -- Tapping parry
 		Stunned = true,  -- Guard broken
+		-- No Dodging edge. A guard is a *stance*: the player is holding a button,
+		-- paying posture for the privilege, and COMBAT_SPEC §1 gives it its own
+		-- state for a reason. Letting a single key escape it for free would make
+		-- the posture economy irrelevant, because the correct play against any
+		-- attack would be "block, then tap Q" rather than "block, or don't".
+		-- The dodge has to be *paid for* by not being in a stance.
 	},
 	Parrying = {
 		Blocking = true, -- Fall back to block after parry window
@@ -56,9 +70,21 @@ local ALLOWED_TRANSITIONS: { [CombatState]: { [CombatState]: boolean } } = {
 	},
 	Stunned = {
 		Idle = true,     -- Stun duration expired
+		-- No Dodging edge. COMBAT_SPEC §2.1: Stunned overrides ALL states
+		-- immediately, and §1 defines it as a complete input lock. A dodge out of
+		-- a stagger would be the one action that beats a stagger.
 	},
 	Executing = {
 		Idle = true,     -- Finisher completed
+	},
+	Dodging = {
+		Idle = true,     -- The 350ms window closed
+		Stunned = true,  -- Hit out of the i-frames, or during recovery
+		-- No Dodging -> Dodging. The controller also refuses a second dodge
+		-- outright, but the table is the authority and this is the edge that
+		-- says so: without it, a mashing player could chain i-frames into one
+		-- long unbroken invulnerability and the dodge would stop costing
+		-- anything at all.
 	},
 }
 

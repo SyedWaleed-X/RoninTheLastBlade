@@ -27,6 +27,7 @@ export type CombatState =
 	| "Parrying"
 	| "Stunned"
 	| "Executing"
+	| "Dodging"
 
 --[[
 	Wire format for an attack. `AttackId` is a server-issued monotonic id used for
@@ -72,12 +73,13 @@ local stateMap: { [string]: CombatState } = {
 	Parrying = "Parrying",
 	Stunned = "Stunned",
 	Executing = "Executing",
+	Dodging = "Dodging",
 }
 
 local CombatStates = table.freeze(stateMap)
 
 --[[
-	Type guard for inbound remotes: rejects anything that is not one of the eight
+	Type guard for inbound remotes: rejects anything that is not one of the nine
 	literal states. Allocation free, so it is safe inside validation schemas.
 ]]
 local function isCombatState(value: any): boolean

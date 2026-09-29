@@ -234,6 +234,51 @@ local function onActionInput(action: CombatAction, inputState: Enum.UserInputSta
 	end
 
 	--[[
+		Day 9 · Part 1/2: the dodge is announced, not queued.
+
+		Everything below this line treats a press as an *intent*: it is either
+		spendable on the spot or worth holding for up to 200ms. A dodge is not an
+		intent in that sense, and routing it through `OfferIntent` was actively
+		wrong twice over:
+
+		  * **It could not work.** The only legal origins for a dodge are `Idle`,
+		    `Windup` and `Recovery`, and `Windup`/`Recovery` are exactly the states
+		    in which `offerIntent` *queues* rather than spends. A queued dodge would
+		    fire on the next Idle, so the feint cancel and the dodge-cancel - the
+		    two reasons the move exists - could never happen at all.
+
+		  * **It would have lied.** `OfferIntent` returning false is the binder's
+		    signal to print `[INPUT BUFFER] Queued`, and a dodge press that was
+		    refused outright also returns false. The playtest showed exactly that:
+		    a [Q] during a respawn printed "[INPUT BUFFER] Queued: Dodge"
+		    immediately after "[DODGE] Ignored: no state machine bound", i.e. a
+		    message asserting a queue entry that did not and would never exist.
+
+		So the press goes straight to the driver - the same shape as the parry
+		press a few lines above - and the trace below reports what actually
+		happened. `DodgeController` owns the direction, the push, the i-frames and
+		the two timers as one indivisible move, and it asks the machine whether
+		the edge exists; this binder still decides nothing about legality.
+
+		Returning before `OfferIntent` also guarantees no stale `Dodge` can ever
+		sit in the 200ms slot, so the single-slot buffer cannot spend a dodge the
+		player has already been told was refused.
+	]]
+	if action == "Dodge" then
+		CombatStateBus.RecordConsumed(action, 0)
+
+		if CombatStateBus.RunDodge() then
+			print(string.format("[INPUT] Dodge thrown at %.3f", os.clock()))
+		else
+			-- The driver has already printed *why* it refused. Saying only that it
+			-- was refused here would leave two traces to correlate instead of one.
+			print(string.format("[INPUT] Dodge refused at %.3f", os.clock()))
+		end
+
+		return Enum.ContextActionResult.Pass
+	end
+
+	--[[
 		Day 4 · Part 2/2: the press is offered to the bound machine, which either
 		spends it on the spot (the character is already Idle) or queues it for the next
 		Idle entry. Before this, every press went straight into the queue and the queue

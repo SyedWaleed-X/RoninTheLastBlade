@@ -69,6 +69,20 @@ local MAX_POSTURE = AttackConfig.MAX_POSTURE
 local GUARD_BREAK_STUN_DURATION = AttackConfig.GUARD_BREAK_STUN_DURATION
 
 --[[
+	Day 9 · Part 1/2: the i-frame contract, read once at module scope.
+
+	These are the values the dodge path is written against, and each is re-derived
+	on *this* side rather than trusted from the wire. The duration in particular
+	is the entire security property: the client says "a dodge started", and the
+	server decides for how long that means anything, using its own clock. A
+	client announcing a ten-second dodge is answered with the same 200ms everybody
+	else gets.
+]]
+local INVULNERABLE_ATTRIBUTE = AttackConfig.INVULNERABLE_ATTRIBUTE
+local DODGE_IFRAME_DURATION = AttackConfig.DODGE_IFRAME_DURATION
+local DODGE_COOLDOWN = AttackConfig.DODGE_COOLDOWN
+
+--[[
 	Day 8 · Part 1/2: the poise stamp, and the `Active` deadline.
 
 	`POSTURE_LAST_HIT_ATTRIBUTE` is written inside `spendPosture` rather than at the
@@ -173,6 +187,16 @@ local deflectClashEvent = ensureRemote(AttackConfig.REMOTE_DEFLECT_CLASH_EVENT)
 	declares, rather than an anonymous side effect hidden in a call.
 ]]
 local _chaosEvent = ensureRemote(AttackConfig.REMOTE_CHAOS_EVENT)
+
+--[[
+	Day 9 · Part 1/2: the dodge channel.
+
+	Registered on the same line as every other remote, for the same reason: this
+	function is the single place that owns the ReplicatedStorage wire contract,
+	and a script that minted its own remote would work in isolation and break
+	silently the day a second writer appeared.
+]]
+local dodgeEvent = ensureRemote(AttackConfig.REMOTE_DODGE_EVENT)
 
 --[[
 	The one live Active window per attacker.
@@ -757,6 +781,138 @@ guardEvent.OnServerEvent:Connect(function(player: Player, isBlocking: any, isPar
 end)
 
 --[[
+	Day 9 · Part 1/2: the dodge, and the i-frames it buys.
+
+	A client may *ask* to dodge, and this is the only place that answers. The
+	answer is a server-written `RoninInvulnerable` boolean on the requesting
+	character, which is exactly the same authority argument as `GuardStateEvent`
+	above and for exactly the same reason: an attribute set here replicates *down*
+	to every client, while the same attribute set by the owning client only ever
+	changes that client's local copy and is never sent back up. So a cheater can
+	ask for a dodge and be granted one, and cannot grant it to itself.
+
+	What arrives over the wire is one Vector3, the dodge's direction. It is
+	type-checked and then used for exactly one thing: the trace line. It decides
+	nothing at all. The window below is timed from *this* side's `os.clock()`, so
+	there is no number a client can send that changes how long it is untouchable.
+
+	Four gates, in cost order, and every one of them matters:
+
+	  1. **Schema.** `typeof(direction) ~= "Vector3"` is a refusal, not a
+	     coercion. ARCHITECTURE.md #2: nothing off the wire is read before its
+	     type is known, and a RemoteEvent does not stop a client from firing
+	     anything in place of a Vector3.
+
+	  2. **The character must be alive and loaded.** Resolved from
+	     `player.Character` rather than from anything on the wire, so a client
+	     cannot hand somebody else's model an i-frame - nor clear one.
+
+	  3. **The cooldown.** This is the gate that has no equivalent on the client.
+	     `ALLOWED_TRANSITIONS` refuses `Dodging -> Dodging`, which stops a
+	     legitimate player from chaining i-frames, but that table lives in the
+	     *dodger's own process* (ARCHITECTURE.md #3) and therefore stops
+	     nothing from an exploiter: the cheapest possible attack is to fire this
+	     remote every 100ms and be permanently invulnerable. The server counts
+	     the gap itself, from its own clock, and that is the only version of the
+	     rule a cheater cannot route around. `DODGE_COOLDOWN` (0.50s) is
+	     deliberately longer than the 0.35s move: it also prices the gap between
+	     the *end* of one dodge and the start of the next, so the move can never
+	     be spammed as a continuous low-cooldown blink.
+
+	  4. **Not already invulnerable.** Covered by gate 3 in practice, stated
+	     explicitly so the reasoning is in the file rather than implied by a
+	     timer. Re-arming a live window would let a client extend it by re-firing
+	     without ever waiting out the original.
+
+	The direction is *not* sanity-checked against a maximum length or against the
+	camera. It is presentation-only, and a rejected-but-tolerated cosmetic value
+	would be a worse outcome than a nonsense-looking trace line.
+
+	The window is closed by a `task.delay` rather than a deadline attribute on the
+	character, and the difference is load-bearing. `PARRY_STATE_ATTRIBUTE` is a
+	deadline because *something else* has to read its width - the attacker asks
+	"is this defender inside a parry window" and needs a number. Nothing reads the
+	remaining i-frames; the hit path below only asks the boolean. A boolean that
+	expires on its own is the smaller state and it cannot go stale: a deadline
+	written into an attribute can be a deadline nobody clears if the character is
+	destroyed mid-window.
+
+	`DODGE_IFRAME_DURATION` is deliberately NOT the full 0.35s of the move. The
+	tail after it is the vulnerable recovery, and honouring the whole window would
+	mean a dodge grants 350ms of invulnerability and the recovery - the part that
+	exists to make the move cost something - would be free.
+]]
+local lastDodgeRequest: { [Player]: number } = {}
+
+dodgeEvent.OnServerEvent:Connect(function(player: Player, direction: any)
+	-- 1. Schema ---------------------------------------------------------------
+	if typeof(direction) ~= "Vector3" then
+		print(string.format(
+			"[EXPLOIT BLOCKED] Rejected dodge from %s - direction was not a Vector3",
+			player.Name
+		))
+		return
+	end
+
+	-- 2. The dodger is this player's own living character ---------------------
+	local character = player.Character
+	if character == nil then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid == nil or humanoid.Health <= 0 then
+		return
+	end
+
+	-- 3. The cooldown --------------------------------------------------------
+	local now = os.clock()
+	local lastRequest = lastDodgeRequest[player]
+	if lastRequest ~= nil and (now - lastRequest) < DODGE_COOLDOWN then
+		print(string.format(
+			"[EXPLOIT BLOCKED] Rejected chained dodge from %s - %.0fms since the last (cooldown %.0fms)",
+			player.Name,
+			(now - lastRequest) * 1000,
+			DODGE_COOLDOWN * 1000
+		))
+		return
+	end
+
+	-- 4. A live window is not re-armed ---------------------------------------
+	if character:GetAttribute(INVULNERABLE_ATTRIBUTE) == true then
+		print(string.format(
+			"[EXPLOIT BLOCKED] Rejected re-armed dodge from %s - i-frames already open",
+			player.Name
+		))
+		return
+	end
+
+	-- Granted. ---------------------------------------------------------------
+	lastDodgeRequest[player] = now
+	character:SetAttribute(INVULNERABLE_ATTRIBUTE, true)
+
+	task.delay(DODGE_IFRAME_DURATION, function()
+		--[[
+			The character is parent-checked because the usual reason to still be
+			inside this window is that the player died or respawned during it.
+			Writing an attribute to a destroyed model is work thrown away, and on
+			a model that has already been replaced the write would be meaningless
+			even if it succeeded.
+		]]
+		if character.Parent ~= nil then
+			character:SetAttribute(INVULNERABLE_ATTRIBUTE, false)
+		end
+	end)
+
+	print(string.format(
+		"[SERVER] %s dodged (%s) - i-frames open for %dms.",
+		character.Name,
+		tostring(direction),
+		DODGE_IFRAME_DURATION * 1000
+	))
+end)
+
+--[[
 	Opens the Active window for a swing.
 
 	The window's length is `ActiveDuration` from the *server's* copy of the frame
@@ -922,6 +1078,46 @@ hitEvent.OnServerEvent:Connect(function(player: Player, target: any, hitIndex: a
 	struckTargets[targetModel] = true
 
 	--[[
+		Day 9 · Part 1/2: the dodge, resolved.
+
+		Placement is the whole design decision, and it is deliberately *after*
+		`struckTargets` and *before* the guard:
+
+		  * **After the debounce.** An evaded hit is still a hit that a real swing
+		    produced against a real target. The blade reached them. If the debounce
+		    were not consumed, an attacker could spray the same defender for the
+		    whole length of one Active window and get a free re-roll on whether
+		    they happened to land inside the i-frames - which is precisely the
+		    exploit the debounce exists to close.
+
+		  * **Before the guard, and before the parry.** Invulnerability is a
+		    stronger claim than a block: a block still takes posture damage and can
+		    still be broken, whereas i-frames take nothing at all. Consulting the
+		    guard first would let a defender who is simultaneously flagged Blocking
+		    (their client still has the button down from before the dodge) absorb
+		    posture during a window in which they should be untouchable, and the
+		    trace would read `[GUARD] Blocked` on a move that should have read
+		    `[EVADED]`. A player who sees "blocked" believes they were hit; a
+		    player who sees "evaded" knows they were not.
+
+		Zero Health and zero posture, and the `return` is the guarantee - exactly
+		the same shape as the block path's "no `TakeDamage` on this path, ever".
+
+		The attribute read is a plain `== true` rather than a truthiness test, for
+		the same reason `readParryWindow` is explicitly typed: `GetAttribute`
+		returns `any`, and a stripping script that left a string here must produce
+		"vulnerable", not a type error inside the hit path.
+	]]
+	if targetModel:GetAttribute(INVULNERABLE_ATTRIBUTE) == true then
+		print(string.format(
+			"[EVADED] %s i-framed attack from %s!",
+			targetModel.Name,
+			character.Name
+		))
+		return
+	end
+
+	--[[
 		7. Directional guard, posture and guard break (Day 6) -----------------------
 
 		Resolved *after* every rejection and immediately before `TakeDamage`, so a
@@ -1079,6 +1275,19 @@ local function seedPosture(character: Model)
 	character:SetAttribute(POSTURE_BROKEN_ATTRIBUTE, false)
 	character:SetAttribute(POSTURE_LAST_HIT_ATTRIBUTE, 0)
 	character:SetAttribute(ACTIVE_STATE_ATTRIBUTE, 0)
+
+	--[[
+		Day 9 · Part 1/2: and the i-frames, seeded to "not invulnerable".
+
+		`false` rather than absent, for the same reason as the pair above. The hit
+		path reads this attribute on *every* resolved hit, and a model that spent
+		its first half second with a nil `RoninInvulnerable` would be a model whose
+		evasion behaviour depends on whether the read found an absent value or a
+		false one. Both currently read as "vulnerable", so this is not about
+		correctness of the dodge - it is that a second consumer written later must
+		not have to guess.
+	]]
+	character:SetAttribute(INVULNERABLE_ATTRIBUTE, false)
 end
 
 local function bindPlayerPosture(player: Player)
@@ -1111,6 +1320,12 @@ Players.PlayerRemoving:Connect(function(player: Player)
 	activeWindows[player] = nil
 	parryLastClaim[player] = nil
 	parryRung[player] = nil
+	-- Day 9 · Part 1/2: the dodge cooldown is per-player bookkeeping and is
+	-- cleared on the same edge. It is the one piece of dodge state that is *not*
+	-- an attribute - the i-frames themselves belong to a body, but the gap between
+	-- requests belongs to a player and has to survive that body dying, or a
+	-- respawn would let a spamming player skip the cooldown entirely.
+	lastDodgeRequest[player] = nil
 end)
 
-print("[SERVER] HitValidator online: RegisterHitEvent, AttackStateEvent, GuardStateEvent, GuardClashEvent, GuardBreakEvent, ParryResultEvent, ComboBreakEvent, DeflectClashEvent and ChaosTestEvent are live.")
+print("[SERVER] HitValidator online: RegisterHitEvent, AttackStateEvent, GuardStateEvent, GuardClashEvent, GuardBreakEvent, ParryResultEvent, ComboBreakEvent, DeflectClashEvent, ChaosTestEvent and DodgeEvent are live.")
