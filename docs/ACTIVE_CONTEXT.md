@@ -1,45 +1,74 @@
 # RONIN: ACTIVE CONTEXT RELAY
-*Last Updated: End of Day 4 · Part 2/2*
+*Last Updated: End of Day 7 (Part 1/2)*
 
 ## 1. Project Phase
-- Completed: Day 1 (Setup, MCP, Git), Day 2 (FSM + Debug HUD), Day 3 (Input Buffer & Telemetry), Day 4 Part 1/2 (3-Hit Chain & Frame Data), Day 4 Part 2/2 (Instant Idle Trigger, Root Motion Lunge, Commitment).
-- Next Up: Day 5 — hitbox resolution during Active, then server-authoritative damage/posture remotes (ARCHITECTURE #2 schemas, #3 authority).
+- Completed: Days 1-4, Day 5 P1/2 + P2/2, Day 6 P1/2 + P2/2, **Day 7 P1/2 (locomotion bleed fix, 133ms parry window + spam decay, attacker posture reflection, hitstop)**.
+- Next Up: Day 7 P2/2 — `Executing` (Deathblow) off a broken guard, then posture regeneration, then the posture HUD.
 
 ## 2. Live System Registry
-- `src/shared/ReplicatedStorage/CombatTypes.luau` (Authoritative Combat States & Types)
-- `src/shared/ReplicatedStorage/StateMachine.luau` (Deterministic FSM + Interruption Matrix)
-- `src/shared/ReplicatedStorage/AttackConfig.luau` (frozen 3-hit frame data, 0.80s chain window; `LungeSpeed` now live)
-- `src/client/StarterPlayerScripts/CombatStateBus.luau` (**+** `SetActionIntake` / `OfferIntent` direct-press seam)
-- `src/client/StarterPlayerScripts/AttackController.local.luau` (**+** root-motion lunge, rotation lock, `COMBO_LENGTH` derived from config)
-- `src/client/StarterPlayerScripts/CombatController.local.luau` (**+** `dispatchAction` single mapping + `offerIntent` direct intake)
-- `src/client/StarterPlayerScripts/InputBuffer.luau` (200ms sliding FIFO queue — unchanged)
-- `src/client/StarterPlayerScripts/InputBinder.local.luau` (**+** routes presses via the bus intake; traces direct vs queued)
-- `src/client/StarterPlayerScripts/InputGate.luau` (debug-only live-input gate)
-- `src/client/StarterPlayerScripts/CombatDebugUI.local.luau` (`COMBO: [ HIT x / 3 ]`; removed a duplicate `InputGate` require)
+- `src/shared/ReplicatedStorage/AttackConfig.luau` (**+** `PARRY_WINDOW_LADDER` {0.133, 0.080, 0.033}, `PARRY_BASE_WINDOW`, `PARRY_SPAM_RESET_COOLDOWN` 0.60, `PARRY_REFLECT_POSTURE` 25, `PARRY_HITSTOP_DURATION` 0.05, `REMOTE_PARRY_RESULT_EVENT`, `REMOTE_COMBO_BREAK_EVENT`, `REMOTE_DEFLECT_CLASH_EVENT`)
+- `src/shared/ReplicatedStorage/CombatTypes.luau` (unchanged; `DeflectResult` still the model, not yet the return type)
+- `src/shared/ReplicatedStorage/StateMachine.luau` (unchanged; `Blocking -> Stunned` already existed)
+- `src/client/StarterPlayerScripts/CombatStateBus.luau` (**+** `ParryResultRecord`/`ParryResultListener` types, `SetParryPressListener`/`NotifyParryPressed`, `SubscribeParryResults`/`FireParryResult`/`GetLastParryResult`/`ClearParryResult`, `SetComboResetHandler`/`ResetComboChain`)
+- `src/client/StarterPlayerScripts/CombatController.local.luau` (**+** requires `ParryWindow` + `Hitstop`; `publishGuardState(isBlocking, isParrying)` now a pair with two dedupe scalars; `SetParryPressListener` publishes the claim; `ownCharacter` guard; `ParryResultEvent` + `ComboBreakEvent` handlers; `ParryWindow.Reset`/`Hitstop.Release`/`ClearParryResult` on teardown)
+- `src/client/StarterPlayerScripts/WeaponVisuals.local.luau` (**+** `RunService` require, `guardBlendValue` mirror, `startLocomotionLock`/`stopLocomotionLock` — a `PreSimulation` connection forcing both shoulder `Transform`s to `CFrame.identity` while the guard blend is live)
+- `src/client/StarterPlayerScripts/GuardSparks.luau` (**+** `isUsablePosition` extracted, `ensureDeflectEmitter`/`emitDeflectSparks` — a second pooled white-hot 26-particle burst on `DeflectClashEvent`, exported as `EmitDeflectAt`)
+- `src/client/StarterPlayerScripts/ParryWindow.luau` (**new** — `OnBlockPressed`/`IsParryActive`/`GetRemainingWindow`/`GetActiveWindow`/`Reset`; owns `currentRung`)
+- `src/client/StarterPlayerScripts/Hitstop.luau` (**new** — `Apply(duration)`/`Release()`; `AutoRotate` off + zero root velocity + all `AnimationTrack.TimeScale = 0`, with a deadline that *extends* rather than restarts)
+- `src/client/StarterPlayerScripts/AttackController.local.luau` (**+** `SetComboResetHandler` → `breakChain`, so a deflect releases the whole swing)
+- `src/client/StarterPlayerScripts/InputBinder.local.luau` (**+** requires `ParryWindow`; `onHoldInput(action, …)` calls `OnBlockPressed()` + `NotifyParryPressed` on the Guard `Begin` edge)
+- `src/client/StarterPlayerScripts/CombatDebugUI.local.luau` (**+** `ParryResult` row, `paintParryResult` + `SubscribeParryResults`; card 214→234, feed rows 122→142, divider 98→118, input card 238→258)
+- `src/client/StarterPlayerScripts/BladeHitbox.luau` (unchanged)
+- `src/server/ServerScriptService/HitValidator.server.luau` (**+** `PARRY_STATE_ATTRIBUTE` `RoninParryUntil`, `parryLastClaim`/`parryRung`, `openParryWindow`/`readParryWindow`/`closeParryWindow`, `resolveDeflect`, third `GuardStateEvent` argument, deflect branch ahead of the posture spend, `parryRung` cleanup on `PlayerRemoving`)
+- Unchanged: `InputBuffer` / `InputGate` / `TestFSM`; `ReplicatedStorage.KatanaModel`
 
 ## 3. Active Invariants
-1. A press goes to `CombatStateBus.OfferIntent`. Idle → spent on the spot; any other state → queued in `InputBuffer` for the next Idle entry (COMBAT_SPEC §2.4). Both paths share the single `dispatchAction` mapping.
-2. `offerIntent` calls `InputBuffer.Clear()` first: a press is the newest intent, and without the eviction a stale Guard would be spent *instead* of the new attack.
-3. Direct spends report `+0 ms` latency — true, since dispatch happens inside the input event.
-4. The `task.spawn`'d Idle listener re-checks `CurrentState == "Idle"` before consuming, so one press cannot be spent twice when the intake already started a swing.
-5. **Root motion:** entering Active builds an `Attachment` + `LinearVelocity` on `HumanoidRootPart` (`VectorVelocity = LookVector * LungeSpeed`, world space) and sets `Humanoid.AutoRotate = false`. Exiting Active destroys both and restores `AutoRotate = true`.
-6. `MaxAxesForce = Vector3.new(100000, 0, 100000)` is honoured only because `ForceLimitsEnabled = true` + `ForceLimitMode = PerAxis` are set explicitly; under engine defaults the engine ignores `MaxAxesForce` entirely.
-7. `stopLunge()` is idempotent and runs on *every* exit out of Active (Recovery, `breakChain` on stun/parry-cancel, next swing). A leaked `LinearVelocity` would fling the character permanently.
-8. `COMBO_LENGTH` is counted from `COMBO_CHAIN` at load, so wrap arithmetic, timeout and the HUD "/ 3" cannot disagree.
-9. `COMBO_RESET_TIMEOUT = 0.80s` runs from the **end** of the last swing; longer gap → next press is Hit 1.
+1. **One observer drives both the server flag and the pose.** `CombatController` already sees every transition from every source, so the same `toState == "Blocking"` test now raises the arms *and* publishes the guard. It is structurally impossible for the character to look like it is guarding while the server thinks it is not.
+2. **Posture lives on the character, not in a server table.** `RoninPosture`/`RoninMaxPosture` are server-written attributes: they replicate to every client for free (a future gauge is a local read), their lifetime *is* the character's (no table to leak on `PlayerRemoving`), and a client editing its own copy still cannot travel it upward — the Day 6 P1/2 exploit story is unchanged.
+3. **`PoiseDamage` is the whole cost of a block.** No chip damage and no separate block-stamina number: the same 15/20/35 that scales the attacker's damage also scales what it costs to absorb it, so Hit 3 is simultaneously the hardest hit to eat and the most likely to break a guard.
+4. **A broken guard is punished by the rules, not by a script.** `breakGuard` clears `RoninBlocking` **on the server first**, so a stunned character cannot keep absorbing strikes while it waits for its client to publish `false`. Verified: post-break hits land for full damage.
+5. **The swing drops the pose before it reads the rest C0.** `restC0 = shoulder.C0` is what the whole swing composes onto; capturing it mid-guard-tween would leave the arm permanently offset. `Release(true)` parks the joints on the spot; the player-visible arms-coming-down tween is CombatController's job, on the same transition.
+6. **The blend value stays connected for the whole return tween.** A `NumberValue` animating with nobody reading it moves nothing — disconnecting before the release tween plays freezes the pose mid-guard. This was a real bug, found in playtest and fixed; the connection is dropped only once the blend has landed on 0.
+7. **The spark emitter is pooled, and the host is `CanQuery = false`.** One reusable emitter per client under an invisible anchored part, retired 1.2s after the last burst. `CanQuery` off is load-bearing: the part sits in Workspace, and a spark the blade's raycast could strike would be reported to the server as a real contact.
+8. **The parry window is a *server* clock, re-derived from a claim.** `GuardStateEvent` carries a third boolean "a window opened", never a duration. The server answers with `openParryWindow`, which writes its **own** `os.clock() + rung` into `RoninParryUntil`. A client that sends a forged width gets a window it must still time, and a client that sends `true` every frame walks down the same ladder a human masher does — the security property is identical to the Day 6 guard flag, because it is the same mechanism.
+9. **The ladder rung is state, not a per-call derivation.** Both sides keep the rung (client `currentRung`, server `parryRung[player]`) because computing it fresh from a single timestamp yields "133 → 133 → 133 → 80 → 80 → 80" and never reaches the floor. This was a real bug, caught only by mashing in a live playtest; a decay that recomputes from scratch is a comparison, not a decay.
+10. **A deflect is an exchange, not a discount.** Defender pays **0 HP and 0 posture**; attacker pays `PARRY_REFLECT_POSTURE` and loses the swing. The parry branch therefore sits *inside* the frontal-block branch and *ahead* of `spendPosture` — anything spent on the defender is the bug.
+11. **Hitstop is local-only and extends rather than restarts.** A client cannot authoritatively freeze another player's body; the server tells each side about its own deflect and each freezes itself. `Hitstop` holds a deadline so a second deflect inside a live freeze pushes the thaw out instead of restoring underneath it.
+12. **The locomotion lock is `PreSimulation`, not `PreAnimation`.** The Animator steps *after* `PreAnimation`, so a write there is overwritten in the same frame; the Motor6D docs name `PreSimulation` as the point where a manual `Transform` is still the one physics reads. Locking cancels the animation's contribution (`Transform = identity`) so the joint sits at exactly the composed `C0` — the legs keep walking, the upper body does not.
+13. Unchanged from earlier days: the arm is still the only swing driver, the trail is still lit only for the Active window, the server still owns every Health change, and a hold still never touches `InputBuffer`.
 
 ## 4. Verified (live playtest, console traces)
-- Direct Idle trigger: `[INPUT] Spent on the spot: LightAttack` on every click, including the first click after a 134s idle gap — the pre-existing "press while already Idle is never spent" gap is closed. Telemetry shows `LIGHT_ATTACK · +0 ms`.
-- Root motion: `Root motion committed: 22.0 / 28.0 / 38.0 studs/s for 120 / 120 / 180 ms`, matching `AttackConfig` exactly.
-- Turn lock: across 4 swings, 28/28 frames with the constraint live had `AutoRotate = false`, 0 frames turnable. Peak observed speed 39.2 studs/s (Hit 3 target 38).
-- Teardown: no leaked `AttackLunge` / `AttackLungeAttachment` after any swing, stun burst or force reset; `AutoRotate` back to `true`.
-- Chain `1 → 2 → 3 → 1`; HUD shows `COMBO: [ HIT x / 3 ]` live (read `HIT 1` right after Hit 3 wrapped).
-- `AttackConfig` still frozen; Day 3 `[T]` chaos suite still passes all 3 buffer invariants after the controller refactor; server `[FSM TEST]` passes.
-- Not reproducible via MCP tooling: a stun landing *inside* the 120ms Active window — virtual input carries tens of seconds of game-time latency per action. That path rests on invariant 7, not on a trace.
+- **Guard stance**: RMB hold gave `Idle -> Blocking`; right shoulder read exactly `X+55 Y+25 Z-45`, left `X+50 Y-30 Z+50`, `RoninGuardBlend = 1`, right hand `(0.09,-0.22,-1.28)` and tip `(-0.32,1.02,-2.01)`, hands **0.82 studs** apart — a genuine two-handed hilt, not one arm waving a sword. `WalkSpeed` 16 -> **9**. The angles were swept on the live rig rather than guessed.
+- **Release**: both shoulders returned to **0.000000 studs** position offset and `0.00 0.00 0.00` rotation, `WalkSpeed` back to **16**, and the `RoninGuardBlend` value was destroyed (the write path fully torn down). No Animator is present on these rigs, so nothing fights the C0 writes.
+- **Attack out of guard** (the invariant that guards the invariant): guard up -> `Blocking -> Idle` + `Idle -> Windup` + `[ATTACK] Executed Hit #1` in the same tick, a full `Windup -> Active -> Recovery -> Idle` swing, and afterwards both shoulders sat at **exactly** zero offset and zero rotation. The character stands straight.
+- **Block vs. no block**, two server-built dummies spread along X, both inside `MAX_HIT_DISTANCE` with verified clear LOS, one strike each in the same window:
+    - frontal, guarding: **0 HP**, `[GUARD] Blocked frontal strike! Posture: 15/100 (Dot: 1.000, +15)`
+    - frontal, not guarding: **10 HP**, `[SERVER HIT CONFIRMED] Struck: D_Open_Frontal for 10 HP`
+- **Posture accumulation to the break**: seven Hit-1 blocks ran `15 -> 30 -> 45 -> 60 -> 75 -> 90 -> 100` (clamped from 105), then `[GUARD BREAK] Posture shattered! D_Guard_Frontal forced into Stunned!`, with `RoninPosture` reset to 0 and `RoninBlocking` false. The three strikes fired *after* the break each landed for **full 10 HP** — the punish window is real, not cosmetic.
+- **Player-side stun**: driving the real `GuardBreakEvent` at the local player produced `Idle -> Stunned` and then `Stunned -> Idle` at **dt 1.516s** (the 1.5s config), with no rejected-transition warnings.
+- **Clash sparks**: the broadcast produced a client-side `RoninSparkHost` at the exact broadcast position, `Rate = 0` (manual `Emit` only), `LightEmission = 1`, `Color[0] = (1, 1, 0.92)` white-hot core, `Color[3] = (0.55, 0.13, 0)` cooling tail, `Speed 9-20`, `Acceleration (0,-34,0)`. Observed across 22 frames, then auto-retired by the pool timer.
+- **Exploits**: the guard still cannot be self-granted, and a client cannot nominate another player's character. Re-confirmed live — setting `RoninBlocking` from the *client* on a dummy did **not** replicate up and the strike landed as unblocked damage, which is the invariant working.
+- No runtime errors after fixing a `stopArmSwing` typo. Test dummies were runtime-only and are removed.
 
-## 5. Known Gaps → Next Task (Day 5)
-- **No hitbox resolution.** Active is a pure state/animation window; nothing queries a blade volume or applies `Damage` / `PoiseDamage` (config values are read for logging only).
-- **No server remotes.** Damage, posture and parry deflection are still client-local prediction — no schema-validated RemoteEvent and no server authority yet (ARCHITECTURE #2/#3 open).
-- `LungeSpeed` is client-predicted; the server must eventually own authoritative knockback so it cannot be spoofed.
-- No Luau CLI (`luau-analyze`/`rojo`/`stylua`): strict typing is verified by Studio Script Sync + playtest, not a static analyzer.
-- The MCP `execute_luau` sandbox has an isolated `require` cache, so client modules cannot be driven from the tool — drive the real input path instead.
+### Day 7 · Part 1/2 — parry, decay, reflection, hitstop
+
+- **Spam ladder, measured by mashing RMB 4x at ~350ms**: `[PARRY] Block pressed: 133ms (rung 1/3)` -> `80ms (rung 2/3)` -> `33ms (rung 3/3)` -> `33ms (rung 3/3)` (floor holds), then a press after the 0.60s cooldown returned to `133ms (rung 1/3)`. Both the client trace and the server's own ladder agreed at every step. **The first build of this failed** — the rung was a function-local, giving `133 -> 133 -> 133 -> 80 -> 80 -> 80` and never reaching the floor; only visible by mashing, never by pressing once.
+- **All three hit resolutions, one dummy, one strike each, dot product 1.000 every time**:
+    - unguarded: `[SERVER HIT CONFIRMED] Struck: D_ParryTarget for 10 HP`
+    - guarding, window closed: `[GUARD] Blocked frontal strike! Posture: 15/100 (Dot: 1.000, +15)` — 0 HP, 15 posture
+    - guarding, window open: `[PERFECT DEFLECT] D_ParryTarget parried divinity_miracle! Reflected 25 posture to attacker. (Window: 133ms, Attacker posture: 25/100)`
+- **Deflect arithmetic, read back from the attributes after the deflect**: defender `HP 100` (untouched, where a block would have made it 90), defender `RoninPosture 0` (untouched), defender `RoninParryUntil 0` (the window was *consumed* by the parry), attacker `RoninPosture 25 / 100`. Attacker HP also untouched — the reflection is posture, not health.
+- **Combo interrupt**: `[PARRY] divinity_miracle had their chain broken by a deflect (+25 posture reflected).` — the attacker-side `ComboBreakEvent` landed and `ResetComboChain` -> `breakChain` released the swing, so the strike in flight cannot be billed twice.
+- **HUD flash**: driving the real targeted `ParryResultEvent` set the label to `PARRY: [ SUCCESS - 133ms, +25 reflected ]` in cyan, and it was **still lit on the following event** 400ms later — proving the 1.2s flash persists rather than flashing for one frame. Card grew 214 -> 234 with the input panel pushed 238 -> 258 so the two cards do not overlap.
+- **Hitstop**: `AutoRotate` measured `true` on the very next read after `Apply` (the 50ms had elapsed and released cleanly), and the console printed `Hitstop 50ms` from the production handler.
+- **Rigor note**: the MCP `execute_luau` `require()` of a live `PlayerScripts` module returns a **fresh copy** (re-confirmed this session — a probe that called `FireParryResult` on that copy left the HUD untouched). Every conclusion above therefore comes from console traces emitted by the running scripts, not from probing the bus directly. The flash was verified by reading the label *inside* the same trace that set it.
+
+## 5. Known Gaps -> Next Task (Day 7 P2/2)
+- **No `Executing` / Deathblow.** A broken guard is currently a free punish window (1.5s of full-damage hits) with no finisher. `Executing` exists in the state table and nothing drives it. This is the natural next step: the parry gives a player a reason to *build* posture on an attacker, and a Deathblow is how that investment cashes in.
+- **Posture does not regenerate.** It only ever resets on a break, so a player who blocks seven light hits is pinned until they are actually broken. Sekiro's rule is that posture recovers while you are not being pressured — a decay term on the server, most likely. The reflection makes this more pressing: a defender who lands four deflects will break the *attacker's* guard, and neither pool coming down means the war never resets.
+- **No posture HUD.** The attributes replicate and are ready to be read, but nothing renders them. A defender cannot see their own guard degrading, nor watch an attacker's pool climb toward the break their parries are causing.
+- **`Parrying` is still not a real combat state.** The 133ms window resolves entirely inside the `Blocking` state; `ALLOWED_TRANSITIONS` has the `Blocking <-> Parrying` edges and `CombatTypes.DeflectResult` models the result, but neither is used. Deliberate for now — a 133ms state flip would spam the transition feed and the guard pose would flicker — but worth revisiting when the parry gains a visual of its own.
+- **The guard is still all-or-nothing**: 100% absorb, no chip damage, and the 145-degree frontal cone has no visual tell.
+- **`SLASH_CLIP_IDS` is still empty on purpose** (unchanged).
+- **Hit detection is still client-local**, so it cannot see another player's blade. The server-side sweep P2/2 made possible now also has a real posture pool to spend on the defender it resolves.
+- **Tooling limits:** no Luau CLI, so strict typing is verified by Script Sync + playtest, not a static analyzer. MCP `execute_luau` `require()` of a live `PlayerScripts` module returns a **fresh copy** (re-confirmed) and can hang past the 60s MCP timeout — drive live state through console traces and direct instance reads instead. CFrame writes on the **client** do not replicate: test dummies must be built *and oriented* on the **Server**. Guard/posture/parry attributes are read off the **Model**, not `HumanoidRootPart` — setting them on the root part silently does nothing and the hit resolves as a clean unguarded strike (cost one confusing test). The blade sweep is short: a dummy beyond ~3 studs is simply not reachable, so place it at **2.5 studs** along the player's current `LookVector` and re-seat it before every strike, because a swing's lunge moves the player. Because a parry window is only 133ms, MCP round-trip latency will expire it — set `RoninParryUntil` to a long value and verify the *resolution*, not the timing. The per-swing one-contact debounce must be outrun between test strikes (>0.22s: Active 0.12 + grace 0.1).

@@ -115,7 +115,7 @@ card.BackgroundColor3 = CARD_BACKGROUND
 card.BackgroundTransparency = 0.05
 card.BorderSizePixel = 0
 card.Position = UDim2.fromOffset(16, 16)
-card.Size = UDim2.fromOffset(CARD_WIDTH, 214)
+card.Size = UDim2.fromOffset(CARD_WIDTH, 234)
 card.Parent = screenGui
 
 local cardStroke = Instance.new("UIStroke")
@@ -171,18 +171,89 @@ local comboLabel = createLabel(
 	UDim2.fromOffset(0, 80), UDim2.new(1, 0, 0, 16)
 )
 
+--[[
+	Day 7 · Part 1/2: the parry result line.
+
+	Sits between the chain row and the transition feed, and it is the only element in
+	this HUD that reports something the *server* decided rather than something the
+	client observed. That distinction is why it flashes rather than persisting: a
+	perfect deflect is an event, and a permanent "PARRY: SUCCESS" row would be a lie
+	about the present tense — the window is long closed by the time the player reads
+	it.
+
+	The window width it quotes is the one the *server* measured, not the one the
+	client predicted. On a press the two can disagree by a rung (they count their own
+	presses independently), and the HUD is deliberately on the server's side of that
+	disagreement, because the server's number is the one the deflect was judged on.
+]]
+local parryLabel = createLabel(
+	card, "ParryResult", "PARRY: [ — ]", 13, Enum.Font.GothamBold, TEXT_DIM,
+	UDim2.fromOffset(0, 98), UDim2.new(1, 0, 0, 16)
+)
+
+--[[
+	How long the success line stays lit, in seconds.
+
+	1.2s is long enough to be read in the middle of a fight and short enough that a
+	second deflect does not have to wait for the first to clear. The line is not a
+	timer, so there is no tween and no per-frame allocation to expire it: the render
+	loop below compares a deadline, which is the same zero-allocation approach the
+	input telemetry's countdown bar already uses.
+]]
+local PARRY_FLASH_DURATION = 1.2
+local parryFlashUntil = 0
+local parryFlashMs = 0
+local parryFlashReflected = 0
+
+--[[
+	Paints the parry line, lit or dimmed.
+
+	`os.clock() >= parryFlashUntil` is the whole expiry rule. It is compared rather
+	than decremented, so there is no accumulator to drift and no timer to cancel: a
+	second deflect simply pushes the deadline out, and the line stays lit for the
+	full window of the *newest* deflect rather than being cut short by the older
+	one's remaining time.
+
+	The reflected posture is in the same line rather than a row of its own, because
+	the two numbers are one fact: "you timed a 133ms window" and "the attacker eats
+	25" are the same event described from two sides, and a player who cannot see the
+	cost they inflicted has no reason to keep attempting the timing.
+]]
+local function paintParryResult()
+	if os.clock() >= parryFlashUntil then
+		parryLabel.Text = "PARRY: [ — ]"
+		parryLabel.TextColor3 = TEXT_DIM
+		return
+	end
+
+	parryLabel.Text = string.format(
+		"PARRY: [ SUCCESS - %dms, +%d reflected ]",
+		parryFlashMs,
+		parryFlashReflected
+	)
+	parryLabel.TextColor3 = COLOR_CYAN
+end
+
+CombatStateBus.SubscribeParryResults(function(record: CombatStateBus.ParryResultRecord)
+	parryFlashMs = math.floor(record.WindowSeconds * 1000)
+	parryFlashReflected = record.ReflectedPosture
+	parryFlashUntil = os.clock() + PARRY_FLASH_DURATION
+
+	paintParryResult()
+end)
+
 local divider = Instance.new("Frame")
 divider.Name = "Divider"
 divider.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
 divider.BackgroundTransparency = 0.85
 divider.BorderSizePixel = 0
-divider.Position = UDim2.new(0, 0, 0, 98)
+divider.Position = UDim2.new(0, 0, 0, 118)
 divider.Size = UDim2.new(1, 0, 0, 1)
 divider.Parent = card
 
 local feedTitleLabel = createLabel(
 	card, "FeedTitle", "TRANSITIONS", 10, Enum.Font.GothamBold, TEXT_DIM,
-	UDim2.fromOffset(0, 106), UDim2.new(1, 0, 0, 12)
+	UDim2.fromOffset(0, 126), UDim2.new(1, 0, 0, 12)
 )
 
 -- Four rows, newest first; filled in by pushHistory.
@@ -190,7 +261,7 @@ local feedRows: { TextLabel } = {}
 for index = 1, HISTORY_DEPTH do
 	local row = createLabel(
 		card, "FeedRow" .. index, "", 11, Enum.Font.Code, TEXT_BRIGHT,
-		UDim2.fromOffset(0, 122 + (index - 1) * 14), UDim2.new(1, 0, 0, 14)
+		UDim2.fromOffset(0, 142 + (index - 1) * 14), UDim2.new(1, 0, 0, 14)
 	)
 	feedRows[index] = row
 end
@@ -205,7 +276,7 @@ inputCard.Name = "InputTelemetryCard"
 inputCard.BackgroundColor3 = CARD_BACKGROUND
 inputCard.BackgroundTransparency = 0.05
 inputCard.BorderSizePixel = 0
-inputCard.Position = UDim2.fromOffset(16, 238)
+inputCard.Position = UDim2.fromOffset(16, 258)
 inputCard.Size = UDim2.fromOffset(CARD_WIDTH, 172)
 inputCard.Parent = screenGui
 
@@ -369,6 +440,23 @@ RunService.RenderStepped:Connect(function()
 	durationLabel.Text = string.format("TIME  %d ms", elapsedMs)
 
 	paintComboState(currentState == "Windup" or currentState == "Active" or currentState == "Recovery")
+
+	--[[
+		Day 7 · Part 1/2: expire the parry flash from the existing render loop rather
+		than on a timer.
+
+		A `task.delay` that reset the label would race the next deflect — two parries
+		inside the flash window would have the first one's timer clear the second
+		one's success line — and it would leave a pending callback aimed at a label
+		that a HUD rebuild may already have destroyed. A deadline compared here cannot
+		be stale, and it costs the loop one comparison and no allocation.
+
+		Note this sits *after* the `if not machine then ... return` early-out above and
+		is therefore skipped while no character is bound. That is deliberate: a flash
+		raised with no machine behind it belongs to a character that is being torn
+		down, and `ClearParryResult` on teardown is what clears that case.
+	]]
+	paintParryResult()
 
 	-- Update Input Telemetry panel (zero per-frame table allocations)
 	local pendingAction = InputBuffer.Peek()
