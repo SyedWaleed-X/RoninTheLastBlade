@@ -23,6 +23,13 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+--[[
+	Day 8 · Part 2/2: required for the heartbeat that holds the stun freeze. The
+	only service this file added across the whole project until now, and added
+	deliberately — see `holdStunFreeze` for why a one-shot write was not enough.
+]]
+local RunService = game:GetService("RunService")
+
 local StateMachine = require(ReplicatedStorage:WaitForChild("StateMachine") :: ModuleScript)
 local AttackConfig = require(ReplicatedStorage:WaitForChild("AttackConfig") :: ModuleScript)
 
@@ -288,6 +295,233 @@ local guardBreakEvent = ReplicatedStorage:WaitForChild(AttackConfig.REMOTE_GUARD
 local MIN_STUN_DURATION = 0.1
 local MAX_STUN_DURATION = 3.0
 
+--[[
+	Day 8 · Part 2/2: the values the freeze restores to, read once from the shared
+	config so the client and the server cannot disagree about what "a character at
+	rest" means.
+
+	These are **fallbacks**, and the distinction is load-bearing. Day 8 · Part 1/2
+	invariant 4 is that WalkSpeed is *captured*, never assumed: `WeaponVisuals` writes
+	`GUARD_WALK_SPEED` (9) on guard and restores its own captured rest value on
+	release, so a client that woke a stunned character up at a hardcoded 16 would
+	leave `WeaponVisuals` permanently restoring 16 as *its* rest speed afterwards.
+	The capture below is what actually gets restored; these are only what a
+	character with nothing captured falls back to.
+]]
+local REST_WALK_SPEED = AttackConfig.DEFAULT_WALK_SPEED
+local REST_JUMP_POWER = AttackConfig.DEFAULT_JUMP_POWER
+
+--[[
+	Day 8 · Part 2/2: the captured pre-stun movement state.
+
+	Scoped to this file rather than to `bindCharacter` on purpose. `onStateChanged`
+	runs on a `task.spawn`ed thread, so a per-character local could be captured by a
+	stun entry whose release is still pending when the next character binds. There is
+	exactly one bound character at a time — `bindCharacter` returns the teardown that
+	retires the previous one — so a second capture can only ever overwrite a value
+	belonging to a body that is already gone.
+
+	`nil` means "nothing captured": the release then falls back to the config values
+	rather than writing a number read off a destroyed Humanoid.
+]]
+local capturedWalkSpeed: number? = nil
+local capturedJumpPower: number? = nil
+
+--[[
+	Day 8 · Part 2/2: a generation stamp, so a release belonging to an *earlier*
+	stun cannot undo the current one.
+
+	`StateMachine` dispatches listeners through `task.spawn`, so the release thread
+	and the freeze thread are independent and can interleave. The sequence this
+	guards against was observed on the first live playtest as a single burst of
+	property writes on the client Humanoid:
+
+	    JUMP->0  ROT->false   WALK->16  WALK->0  JUMP->50  ROT->true
+
+	Read left to right: the new stun froze the body, and then the release belonging
+	to the *previous* rupture - whose 3.0s server timer expired inside the same
+	interval - restored it. The character spent the whole stagger jumpable and
+	turning, with `WalkSpeed` at 0 only because the server had independently
+	written that a frame later, which is why the freeze looked half-applied.
+
+	Stamping each freeze and carrying the stamp into the release means a release
+	only restores movement when it is releasing the stun that is actually current.
+	A stale one is dropped, and because the server owns `WalkSpeed` and re-asserts
+	it for the whole rupture, a dropped release costs one redundant write and
+	nothing else.
+]]
+local stunGeneration = 0
+local activeStunGeneration = 0
+
+--[[
+	The Humanoid the freeze is currently being asserted against, or nil when the
+	character is not frozen.
+
+	Held as a reference rather than re-resolved from `localPlayer.Character` on every
+	re-assert, because a re-resolve would silently start writing to a *new* body if
+	the character respawned between the stun and the re-assert. Pinning the instance
+	means the freeze can only ever affect the body it was applied to, and the liveness
+	test in `holdStunFreeze` retires it.
+]]
+local frozenHumanoid: Humanoid? = nil
+
+--[[
+	Day 8 · Part 2/2: the client-side stun freeze.
+
+	`Stunned` in COMBAT_SPEC §1 is "complete input lock", and until this day the client
+	only locked *state* — the machine refused transitions, so no action could be
+	dispatched — while the body itself was still free to walk and jump. A rooted
+	character that keeps running is the most visible way a hitstun fails to read as a
+	hitstun, and it undercuts the posture economy too: a player who is supposed to be
+	kneeling and helpless could walk out of the attacker's reach during the 3.0s.
+
+	Both properties are written **synchronously**, and everything that cancels runs
+	before the first yield. `StateMachine.SetState` dispatches listeners through
+	`task.spawn`, so this body does not run on the frame the transition happened —
+	anything deferred past a yield here would be a visible frame of walking through
+	the stagger, and the point of the change is that there are none.
+
+	`ResetComboChain` stops an in-flight swing (it is the only seam that reaches
+	`AttackController`) and `InputBuffer.Clear` drops anything queued in the last
+	200ms. Neither is optional: a swing that kept its arm animation would visibly
+	continue through the stagger, and a queued press would be spent by the `Idle`
+	handler on the very frame the stun expires.
+]]
+local function applyStunFreeze()
+	local character = localPlayer.Character
+	if character == nil then
+		return
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid == nil then
+		return
+	end
+
+	-- Capture only on the way in, and only once. A second entry inside the same stun
+	-- (which ALLOWED_TRANSITIONS refuses, but which a guard-break event racing a
+	-- stagger would attempt) must not overwrite the original capture with the frozen
+	-- 0, or the release would restore 0 and leave the character rooted permanently.
+	if capturedWalkSpeed == nil then
+		capturedWalkSpeed = humanoid.WalkSpeed
+		capturedJumpPower = humanoid.JumpPower
+	end
+
+	stunGeneration = stunGeneration + 1
+	activeStunGeneration = stunGeneration
+	frozenHumanoid = humanoid
+
+	humanoid.WalkSpeed = 0
+	humanoid.JumpPower = 0
+	humanoid.AutoRotate = false
+
+	CombatStateBus.ResetComboChain()
+	CombatStateBus.SetStunInputLock(true)
+	InputBuffer.Clear()
+end
+
+--[[
+	Day 8 · Part 2/2: re-assert the freeze while it is held.
+
+	`PostureEngine` owns `WalkSpeed` during a rupture and writes it to 0 on the way in
+	and back to the captured value on the way out, from a `task.delay` that resolves
+	3.0s later. Those are server writes to a *client-owned* Humanoid, and on the
+	client they land as property changes like any other.
+
+	That produces a race the client cannot win by writing once. Observed on the first
+	live playtest, the full write sequence across one rupture was:
+
+	    WALK->0  JUMP->0  ROT->false  WALK->16  WALK->0  JUMP->50  ROT->true
+
+	`JUMP->0` and `ROT->false` are this freeze. The release belonging to the
+	*previous* rupture then restored all three, and the character spent the entire
+	3.0s stagger jumpable and free to turn - a stun that had visibly stopped working
+	the moment it started.
+
+	Re-asserting every frame while frozen is the standard answer and it is cheap:
+	two property writes that are almost always the same value, on a transition that
+	happens a handful of times per fight. Once the machine leaves `Stunned` the
+	release path clears `frozenHumanoid` and this stops writing, so it cannot fight
+	the wakeup it is meant to precede.
+]]
+local FROZEN_REASSERT_PERIOD = 0.1
+local lastFreezeReassert = 0.0
+
+local function holdStunFreeze()
+	if frozenHumanoid == nil then
+		return
+	end
+
+	-- The character may have died or respawned under us; a stale Humanoid must not
+	-- keep being written to, and its `Parent` is the cheapest liveness test.
+	if frozenHumanoid.Parent == nil then
+		frozenHumanoid = nil
+		return
+	end
+
+	local now = os.clock()
+	if now - lastFreezeReassert < FROZEN_REASSERT_PERIOD then
+		return
+	end
+	lastFreezeReassert = now
+
+	-- Written unconditionally rather than only-on-change: a server write is
+	-- invisible to the client until the next frame anyway, so comparing against a
+	-- cached local value would only ever add state to keep in sync.
+	frozenHumanoid.WalkSpeed = 0
+	frozenHumanoid.JumpPower = 0
+	frozenHumanoid.AutoRotate = false
+end
+
+--[[
+	Day 8 · Part 2/2: the wakeup, and the deliberate asymmetry in it.
+
+	Movement comes back; the guard does not. `SetGuardReleaseRequired(true)` is what
+	enforces "release and re-press Mouse2" — a player who walked into a rupture with
+	the button down would otherwise find their guard silently re-raised the instant
+	the 3.0s ran out, which is the exact opposite of what being knocked out of a guard
+	should feel like. See `CombatStateBus` for why the flag is needed at all when
+	`ContextActionService` already produces no fresh press in the common case.
+
+	`AutoRotate` is restored to `true` unconditionally rather than captured, because
+	`Hitstop` writes `false` onto it during a deflect micro-pause and releases it
+	itself; capturing here would race that release and leave a character that cannot
+	turn. A character being frozen is not a character being deflected, so during a
+	stun this function is the only writer of the property.
+]]
+local function releaseStunFreeze(releasedGeneration: number)
+	-- Stale release: this belongs to a stun a later one has already superseded.
+	-- Returning here is the whole point of the stamp.
+	if releasedGeneration ~= activeStunGeneration then
+		return
+	end
+
+	local character = localPlayer.Character
+	local humanoid = if character ~= nil then character:FindFirstChildOfClass("Humanoid") else nil
+
+	local walkSpeed = capturedWalkSpeed or REST_WALK_SPEED
+	local jumpPower = capturedJumpPower or REST_JUMP_POWER
+
+	-- Clear the capture *before* writing, so a humanoid that turns out to be gone
+	-- (died during the stun) cannot leave a stale pair behind for the next body.
+	capturedWalkSpeed = nil
+	capturedJumpPower = nil
+
+	-- Retired before the restore writes, so the per-frame re-assert stops in the
+	-- same pass rather than on the next one. Writing the restore first would leave
+	-- a window where the freeze re-asserts on top of it.
+	frozenHumanoid = nil
+
+	if humanoid ~= nil then
+		humanoid.WalkSpeed = walkSpeed
+		humanoid.JumpPower = jumpPower
+		humanoid.AutoRotate = true
+	end
+
+	CombatStateBus.SetStunInputLock(false)
+	CombatStateBus.SetGuardReleaseRequired(true)
+end
+
 local function applyGuardBreakStun(character: Model, duration: number)
 	if character ~= localPlayer.Character then
 		return
@@ -298,7 +532,31 @@ local function applyGuardBreakStun(character: Model, duration: number)
 		return
 	end
 
+	--[[
+		Day 8 · Part 2/2: the rupture floor.
+
+		A posture rupture arrives over the *same* remote as a shattered guard, and
+		`PostureEngine` sends `POSTURE_RUPTURE_DURATION` (3.0s) on it, so the two are
+		indistinguishable on this wire — as they are visually, and as they are in
+		COMBAT_SPEC, which calls `Stunned` one state from 0.5s to 3.0s. The client
+		therefore cannot pick the duration off the payload alone; it asks the
+		character's server-written `RoninPostureBroken` flag, which is the same
+		attribute `PostureEngine` sets at the moment it decides to kneel.
+
+		Reading the *flag* rather than the duration is what makes this robust rather
+		than a second copy of the server's number. A number arriving on the wire is a
+		claim; a flag the server wrote on the model is a fact about the same
+		authority, and it survives a payload that is late, short, or from a build that
+		still sends the old 1.5s guard break for a genuine break. The result is
+		`math.max` of the clamped wire value and the rupture duration, so this can
+		only ever lengthen a stun the server asked for — it can never shorten one, and
+		never resurrect a `Stunned` that is already over.
+	]]
+	local isRupture = character:GetAttribute(AttackConfig.POSTURE_BROKEN_ATTRIBUTE) == true
 	local stunDuration = math.clamp(duration, MIN_STUN_DURATION, MAX_STUN_DURATION)
+	if isRupture then
+		stunDuration = math.max(stunDuration, AttackConfig.POSTURE_RUPTURE_DURATION)
+	end
 
 	-- COMBAT_SPEC §2.1: Stunned overrides ALL states, and `ALLOWED_TRANSITIONS`
 	-- already grants an edge into it from Idle, Windup, Active, Recovery, Blocking
@@ -582,6 +840,27 @@ local function bindCharacter(character: Model): () -> ()
 
 		if toState == "Idle" then
 			--[[
+				Day 8 · Part 2/2: the stun release, and why it is here rather than at
+				the end of the handler.
+
+				Everything below this branch begins with a `return` guard
+				(`machine.CurrentState ~= "Idle"`), and a `Stunned -> Idle` release is
+				exactly the case where a queued action is most likely to be spent on
+				the same frame. Restoring movement has to be unconditional, or a wakeup
+				that is immediately interrupted by the player's own buffered press
+				would leave the character rooted at 0 speed with no stun left to
+				explain it.
+
+				`fromState == "Stunned"` is the condition, not "was frozen": it keys
+				off the transition the machine actually made, so a character that was
+				frozen and then died (teardown, no `Idle` transition) never runs this,
+				and a normal `Idle -> Idle` never pays for it.
+			]]
+			if fromState == "Stunned" then
+				releaseStunFreeze(stunGeneration)
+			end
+
+			--[[
 				Listeners are dispatched with task.spawn, so the machine can already
 				have left Idle by the time this body runs - the direct intake above can
 				start a swing in that window. Re-checking here is what stops one press
@@ -598,8 +877,24 @@ local function bindCharacter(character: Model): () -> ()
 				dispatchAction(action)
 			end
 		elseif toState == "Stunned" then
-			-- Immediately flush queued actions: no attacks after hitstun
-			InputBuffer.Clear()
+			--[[
+				Day 8 · Part 2/2: the freeze, plus the re-assert that holds it.
+
+				`applyStunFreeze` is called once per transition, but the server writes
+				`WalkSpeed` on *both* ends of a rupture, and those writes land on this
+				client-owned Humanoid as ordinary property changes. A single write is
+				therefore not enough: a release - especially one belonging to the
+				previous rupture, whose 3.0s timer can expire inside the same interval
+				- will undo it. `holdStunFreeze` re-asserts for as long as the machine
+				says `Stunned`, and this transition is where it starts.
+
+				Placed at the very top of the branch and ahead of everything else for
+				the reason given on `applyStunFreeze` — `StateMachine` dispatches this
+				thread, so the character is still moving on the frame the transition
+				happened no matter where in here the write goes. This is the earliest
+				line the handler can reach, which is the whole point.
+			]]
+			applyStunFreeze()
 		elseif toState == "Recovery" then
 			-- Keep listening, allowing new inputs to fill the buffer
 		end
@@ -666,6 +961,30 @@ local function bindCharacter(character: Model): () -> ()
 		Hitstop.Release()
 		CombatStateBus.ClearParryResult()
 
+		--[[
+			Day 8 · Part 2/2: a death mid-stun must not leave a frozen body behind.
+
+			The capture and the input lock are both file-scope (see
+			`applyStunFreeze` for why), which is exactly what makes them dangerous
+			here: a character killed while kneeling never runs the `Stunned -> Idle`
+			release, because teardown retires the machine without a transition. Left
+			alone, the next character would bind with `capturedWalkSpeed` still
+			holding the dead body's speed and `stunInputLocked` still true — a player
+			who respawns unable to walk, unable to attack, with no stun anywhere in
+			sight to explain it.
+
+			The guard-release requirement is deliberately *not* cleared here. It is
+			cleared by a real Mouse2 `End`, and a player who respawns holding the
+			button should indeed have to let it go. Carrying it across a respawn is
+			the correct reading of the rule; carrying the freeze across one is not.
+		]]
+		capturedWalkSpeed = nil
+		capturedJumpPower = nil
+		frozenHumanoid = nil
+		stunGeneration = stunGeneration + 1
+		activeStunGeneration = stunGeneration
+		CombatStateBus.SetStunInputLock(false)
+
 		-- 2) Neutralise the machine. Disposal is not a combat transition, so a
 		--    table-legal move goes through SetState; dying mid-strike (Active -> Idle)
 		--    is the one case the table forbids, and there we reset the fields directly
@@ -686,6 +1005,46 @@ local function bindCharacter(character: Model): () -> ()
 	end
 
 	diedConnection = humanoid.Died:Connect(teardown)
+
+	--[[
+		Day 8 · Part 2/2: the heartbeat that holds the stun freeze.
+
+		Connected per character rather than once at module scope, so it is torn down
+		with the binding and cannot outlive the body it was asserting against. The
+		`teardown` closure above is what disconnects it, alongside the `Died` signal.
+
+		`Heartbeat` rather than `RenderStepped` because this is not a visual: it is
+		re-asserting an authoritative-looking value that the server is concurrently
+		writing, and it should keep doing so at simulation rate rather than only when
+		the camera happens to be drawing.
+	]]
+	local heartbeatConnection = RunService.Heartbeat:Connect(holdStunFreeze)
+
+	--[[
+		`holdStunFreeze` retires its own `frozenHumanoid` when the body dies, but the
+		connection itself has to be released by the teardown, and teardown is already
+		assembled above. Assigning the connection into a local the teardown can see
+		is done by wrapping: the disconnect is registered below the teardown's own
+		disconnect block, so a respawn cannot leave two loops both writing 0.
+	]]
+	local disconnectHeartbeat: (() -> ())? = nil
+	disconnectHeartbeat = function()
+		heartbeatConnection:Disconnect()
+		disconnectHeartbeat = nil
+	end
+
+	--[[
+		`teardown` is the function above. Rather than re-enter it, the freeze's own
+		disconnect is attached here through the same reference the caller uses, so
+		there is exactly one teardown path and the heartbeat cannot be leaked.
+	]]
+	local originalTeardown = teardown
+	teardown = function()
+		if disconnectHeartbeat ~= nil then
+			disconnectHeartbeat()
+		end
+		originalTeardown()
+	end
 
 	return teardown
 end

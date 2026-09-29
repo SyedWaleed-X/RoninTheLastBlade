@@ -173,6 +173,130 @@ local MAX_POSTURE = 100
 local GUARD_BREAK_STUN_DURATION = 1.5
 
 --[[
+	Day 8 · Part 1/2: the posture *recovery* contract.
+
+	`POSTURE_BROKEN_ATTRIBUTE` is the server's "this character is currently kneeling
+	from a posture rupture" flag. It is a **boolean**, matching `GUARD_STATE_ATTRIBUTE`
+	rather than the number the Day 8 brief used as a placeholder type: Roblox locks an
+	attribute's type on first write, and the neighbouring guard flag is already a
+	boolean. Writing `1`/`0` here would therefore have produced a second, differently
+	typed flag on the same model for no gain — every reader here tests it for identity
+	against `true`, exactly as `resolveGuard` does.
+
+	`POSTURE_LAST_HIT_ATTRIBUTE` is an `os.clock()` stamp of the last *poise* hit on
+	this character, and it is the input to the recovery grace period. Without it a
+	guard could never recover: the block that spends posture is also what would spend
+	the recovery, so a character under sustained pressure would sit at whatever it
+	climbed to forever. It is an attribute for the same reason `RoninParryUntil` is
+	one — the value's lifetime is the character's, so there is no server table to leak
+	on `PlayerRemoving`, and it is server-written, so a client editing its local copy
+	changes nothing the engine reads.
+]]
+local POSTURE_BROKEN_ATTRIBUTE = "RoninPostureBroken"
+local POSTURE_LAST_HIT_ATTRIBUTE = "RoninLastPostureHitTime"
+
+--[[
+	Day 8 · Part 1/2: how long after the last poise hit recovery stays suspended.
+
+	1.2s. Long enough to cover a whole exchange rather than reacting between two
+	hits of the *same* swing, and short enough that a player who disengages feels
+	their guard come back rather than waiting out a long invisible timer. The number
+	is the direct expression of Sekiro's rule that posture recovers "while you are
+	not being pressured" — pressure is not "is blocking", it is "was just hit".
+]]
+local POSTURE_HIT_RECOVERY_DELAY = 1.2
+
+--[[
+	Day 8 · Part 1/2: the non-linear recovery ladder, keyed on *Health* percentage.
+
+	Recovery is deliberately not a flat rate, because a flat rate makes Health
+	irrelevant to the posture war. With one rate, a player at 10 HP and a player at
+	100 HP recover identically and there is no reason to disengage to heal. The three
+	tiers turn Health into the thing that decides how long a broken guard takes to
+	recover from:
+
+		hpPct >= 0.75  ->  16/sec. A healthy fighter regroups in about six seconds.
+		hpPct >= 0.25  ->   8/sec. Halved: wounded fighters are measurably slower to
+		                     re-guard, so trading blows has a compounding cost.
+		hpPct <  0.25  ->   0/sec. ZERO recovery. Below a quarter Health a character
+		                     cannot rebuild a guard at all and is one block from a
+		                     second rupture. This is the tier that makes the posture
+		                     war decide fights instead of being a resource both sides
+		                     refill at the same rate.
+
+	Two thresholds and three rates is the whole tuning surface. They are named here
+	rather than inlined in the engine because they are the numbers a designer tunes,
+	and a ladder split across two files is a ladder that drifts.
+]]
+local POSTURE_RECOVERY_HEALTHY_THRESHOLD = 0.75
+local POSTURE_RECOVERY_MID_THRESHOLD = 0.25
+local POSTURE_RECOVERY_RATE_HEALTHY = 16
+local POSTURE_RECOVERY_RATE_MID = 8
+local POSTURE_RECOVERY_RATE_CRITICAL = 0
+
+--[[
+	Day 8 · Part 1/2: the rupture itself.
+
+	`POSTURE_RUPTURE_DURATION` is 3.0s — deliberately the very top of the 0.5-3.0s
+	band COMBAT_SPEC §1 gives `Stunned`. A guard break is the most expensive thing
+	that can happen to a player in a posture war, and a rupture is the *second* one
+	being spent on top of it: the character is already carrying posture damage from
+	the strike that broke them. It is the longest lock in the spec for that reason,
+	and because 3.0s is also the ceiling the client's `applyGuardBreakStun` clamps to
+	(`MAX_STUN_DURATION`), the clamp is a no-op here rather than a silent truncation.
+
+	`DEFAULT_WALK_SPEED` is Roblox's stock Humanoid WalkSpeed of 16. It is a
+	*fallback*, not the restore target: the engine captures whatever the character
+	was actually walking at when the rupture landed and puts that back. Hardcoding a
+	restore to 16 would be wrong for any character whose speed is not 16 — and one
+	exists in this project already: `WeaponVisuals` writes `GUARD_WALK_SPEED` (9) on
+	guard and restores a captured "rest" value on release, so a rupture that landed
+	mid-guard and restored a hardcoded 16 would leave the client restoring *16* as
+	its rest speed forever after. Capture-and-restore keeps the two writers from
+	corrupting each other.
+]]
+local POSTURE_RUPTURE_DURATION = 3.0
+local DEFAULT_WALK_SPEED = 16
+
+--[[
+	Day 8 · Part 2/2: the client's stun-rooting restore target for jumping.
+
+	`DEFAULT_JUMP_POWER` is Roblox's stock Humanoid JumpPower of 50 — it is seeded from
+	`StarterPlayer.CharacterJumpPower`, whose default is 50 and whose range is 0-1000.
+	`UseJumpPower` is true by default, so `JumpPower` (rather than `JumpHeight`) is the
+	property the engine is actually reading, which is why the client zeroes and
+	restores *this* property rather than the newer one.
+
+	Like `DEFAULT_WALK_SPEED` above it is a **fallback, not the restore target**.
+	`CombatController` captures whatever the local character was actually walking and
+	jumping at when the stun landed and puts those numbers back. A character that was
+	mid-guard walks at `GUARD_WALK_SPEED` (9), and a rupture that landed on it should
+	wake that character up walking at 9 — restoring a hardcoded 16 here would leave the
+	client permanently editing a rest speed the rest of the project never agreed with.
+]]
+local DEFAULT_JUMP_POWER = 50
+
+--[[
+	Day 8 · Part 1/2: how the server reads "this character is mid-swing".
+
+	Recovery is suspended while a character is `Blocking` or `Active`, and the
+	server has no state machine of its own to ask (ARCHITECTURE #3 — the machine
+	lives in the owning client's process, which is exactly why `breakGuard` *carries*
+	its transition across on a targeted event instead of applying it).
+
+	`Blocking` needs no new attribute: `GUARD_STATE_ATTRIBUTE` is already a
+	server-written boolean on the character, so the engine reads that directly and
+	the two can never disagree.
+
+	`Active` does need one, and it is the same shape as `PARRY_STATE_ATTRIBUTE` — an
+	absolute `os.clock()` deadline written by `HitValidator` when it opens the Active
+	window, rather than a boolean that has to be polled and cleared from two places.
+	A deadline expires on its own and needs no teardown, and it is strictly
+	server-written, so a client cannot claim a swing to suppress its own recovery.
+]]
+local ACTIVE_STATE_ATTRIBUTE = "RoninActiveUntil"
+
+--[[
 	The two remotes Part 2/2 adds. Same reasoning as the guard remote above: the name
 	lives in one place so a disagreement between the two sides fails loudly at load
 	instead of silently doing nothing.
@@ -298,6 +422,24 @@ local REMOTE_PARRY_RESULT_EVENT = "ParryResultEvent"
 local REMOTE_COMBO_BREAK_EVENT = "ComboBreakEvent"
 local REMOTE_DEFLECT_CLASH_EVENT = "DeflectClashEvent"
 
+--[[
+	Day 8 · Part 2/2: the client -> server handshake for the posture chaos suite.
+
+	The [Y] harness cannot assert a *server* invariant from the client: it can set
+	attributes on its own copy of the model, but those writes never replicate back and
+	the client is not the party that decides a rupture. So the two Day 8 tests that
+	genuinely need server truth (the 99.9% edge and the death-during-rupture
+	override) are driven over this remote and answered on the same one, while the
+	invariants that *are* client-side (freeze enforced, listeners torn down) are
+	asserted locally against the real bound machine.
+
+	One remote, two directions, rather than a request remote and a reply remote: a
+	test that reports its own result on the channel that asked for it cannot have its
+	answer delivered to a different player's client by mistake, and the suite is
+	strictly one-shot so there is nothing for a second channel to disambiguate.
+]]
+local REMOTE_CHAOS_EVENT = "ChaosTestEvent"
+
 local MAX_HIT_DISTANCE = 14
 
 --[[
@@ -322,6 +464,18 @@ local AttackConfig = table.freeze({
 	MAX_POSTURE_ATTRIBUTE = MAX_POSTURE_ATTRIBUTE,
 	MAX_POSTURE = MAX_POSTURE,
 	GUARD_BREAK_STUN_DURATION = GUARD_BREAK_STUN_DURATION,
+	POSTURE_BROKEN_ATTRIBUTE = POSTURE_BROKEN_ATTRIBUTE,
+	POSTURE_LAST_HIT_ATTRIBUTE = POSTURE_LAST_HIT_ATTRIBUTE,
+	POSTURE_HIT_RECOVERY_DELAY = POSTURE_HIT_RECOVERY_DELAY,
+	POSTURE_RECOVERY_HEALTHY_THRESHOLD = POSTURE_RECOVERY_HEALTHY_THRESHOLD,
+	POSTURE_RECOVERY_MID_THRESHOLD = POSTURE_RECOVERY_MID_THRESHOLD,
+	POSTURE_RECOVERY_RATE_HEALTHY = POSTURE_RECOVERY_RATE_HEALTHY,
+	POSTURE_RECOVERY_RATE_MID = POSTURE_RECOVERY_RATE_MID,
+	POSTURE_RECOVERY_RATE_CRITICAL = POSTURE_RECOVERY_RATE_CRITICAL,
+	POSTURE_RUPTURE_DURATION = POSTURE_RUPTURE_DURATION,
+	DEFAULT_WALK_SPEED = DEFAULT_WALK_SPEED,
+	DEFAULT_JUMP_POWER = DEFAULT_JUMP_POWER,
+	ACTIVE_STATE_ATTRIBUTE = ACTIVE_STATE_ATTRIBUTE,
 	REMOTE_GUARD_CLASH_EVENT = REMOTE_GUARD_CLASH_EVENT,
 	REMOTE_GUARD_BREAK_EVENT = REMOTE_GUARD_BREAK_EVENT,
 	GUARD_WALK_SPEED = GUARD_WALK_SPEED,
@@ -334,6 +488,7 @@ local AttackConfig = table.freeze({
 	REMOTE_PARRY_RESULT_EVENT = REMOTE_PARRY_RESULT_EVENT,
 	REMOTE_COMBO_BREAK_EVENT = REMOTE_COMBO_BREAK_EVENT,
 	REMOTE_DEFLECT_CLASH_EVENT = REMOTE_DEFLECT_CLASH_EVENT,
+	REMOTE_CHAOS_EVENT = REMOTE_CHAOS_EVENT,
 	MAX_HIT_DISTANCE = MAX_HIT_DISTANCE,
 	ACTIVE_WINDOW_GRACE = ACTIVE_WINDOW_GRACE,
 })

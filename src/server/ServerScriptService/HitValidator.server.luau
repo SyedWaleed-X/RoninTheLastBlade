@@ -69,6 +69,25 @@ local MAX_POSTURE = AttackConfig.MAX_POSTURE
 local GUARD_BREAK_STUN_DURATION = AttackConfig.GUARD_BREAK_STUN_DURATION
 
 --[[
+	Day 8 · Part 1/2: the poise stamp, and the `Active` deadline.
+
+	`POSTURE_LAST_HIT_ATTRIBUTE` is written inside `spendPosture` rather than at the
+	two call sites, so the stamp cannot be forgotten by a third one added later. The
+	deflect path spends posture on the *attacker* through this same function, which is
+	exactly right: reflected posture is pressure on the attacker, so the attacker's
+	own recovery grace has to start too — otherwise a defender could parry-spam an
+	opponent faster than that opponent recovers and never let them back into the fight.
+
+	`ACTIVE_STATE_ATTRIBUTE` is a deadline rather than a boolean for the same reason
+	`PARRY_STATE_ATTRIBUTE` is: it is written where the window is opened and expires
+	on its own, so there is no teardown path that can leave it stuck on.
+]]
+local POSTURE_BROKEN_ATTRIBUTE = AttackConfig.POSTURE_BROKEN_ATTRIBUTE
+local POSTURE_LAST_HIT_ATTRIBUTE = AttackConfig.POSTURE_LAST_HIT_ATTRIBUTE
+local POSTURE_LAST_HIT_ATTRIBUTE = AttackConfig.POSTURE_LAST_HIT_ATTRIBUTE
+local ACTIVE_STATE_ATTRIBUTE = AttackConfig.ACTIVE_STATE_ATTRIBUTE
+
+--[[
 	Day 7 · Part 1/2: the parry contract, read on the server side of the wire.
 
 	Re-derived here rather than taken from the message, for the same reason
@@ -132,6 +151,28 @@ local guardBreakEvent = ensureRemote(AttackConfig.REMOTE_GUARD_BREAK_EVENT)
 local parryResultEvent = ensureRemote(AttackConfig.REMOTE_PARRY_RESULT_EVENT)
 local comboBreakEvent = ensureRemote(AttackConfig.REMOTE_COMBO_BREAK_EVENT)
 local deflectClashEvent = ensureRemote(AttackConfig.REMOTE_DEFLECT_CLASH_EVENT)
+
+--[[
+	Day 8 Part 2/2: the chaos suite's channel.
+	
+	Registered here, and not created by `PostureChaos` itself, for the same reason
+	every other remote on this line is: this function is the single place that owns
+	the ReplicatedStorage wire contract. A script that minted its own remote would
+	work in isolation and break the day a second writer appeared - and it would
+	break silently, because a missing remote is a nil that every listener treats
+	as "no events today".
+	
+	This was found the hard way: the first playtest of Day 8 P2/2 logged
+	"[POSTURE CHAOS] ChaosTestEvent not found" while every other remote was live,
+	because nothing had ever registered this one.
+]]
+--[[ 
+	Registered for its side effect only: `PostureChaos` owns the connection and
+	reads the handle itself, by design (it must resolve lazily - see the note there).
+	The name is kept so the remote is visibly part of the wire contract this script
+	declares, rather than an anonymous side effect hidden in a call.
+]]
+local _chaosEvent = ensureRemote(AttackConfig.REMOTE_CHAOS_EVENT)
 
 --[[
 	The one live Active window per attacker.
@@ -344,6 +385,24 @@ end
 ]]
 local function spendPosture(character: Model, amount: number): (number, number, boolean)
 	local current, maximum = ensurePosture(character)
+
+	--[[
+		Day 8 · Part 1/2: the poise stamp, and why it lives here.
+
+		`PostureEngine` suspends recovery for `POSTURE_HIT_RECOVERY_DELAY` after a
+		poise hit, and this function is the *only* place posture is ever spent in the
+		project — the block path and the deflect's reflection both route through it.
+		Stamping inside it means a new caller cannot introduce posture damage without
+		also introducing the pressure that suspends recovery, which is the coupling the
+		rule actually needs.
+
+		Written on every spend rather than only on one that *changes* the pool: a
+		character already at the maximum still had their guard hit, and their recovery
+		should still be suspended. A reflected deflect landing on an attacker at 0
+		posture is the clearest case — nothing visible changed on that character, but
+		they were absolutely pressured.
+	]]
+	character:SetAttribute(POSTURE_LAST_HIT_ATTRIBUTE, os.clock())
 
 	-- A negative PoiseDamage would be a healing guard. The frame data is server-owned
 	-- and positive, so this is a guard against a future edit rather than a live input,
@@ -731,10 +790,33 @@ attackStateEvent.OnServerEvent:Connect(function(player: Player, hitIndex: any)
 	-- not carry into it.
 	table.clear(struckTargets)
 
-	activeWindows[player] = {
-		HitIndex = hitIndex,
-		ExpiresAt = now + data.ActiveDuration + ACTIVE_WINDOW_GRACE,
-	}
+--[[
+Day 8 - Part 1/2: mirror the Active window onto the character.
+
+PostureEngine must suspend posture recovery mid-swing, and it owns no state
+machine to ask - the machine lives in the client's process (ARCHITECTURE.md #3).
+This attribute is that answer, and it is the *same* deadline the hit gate below
+already computes: one number, written once, read by two consumers. Deriving it
+a second time for the engine would be two answers to one question.
+
+Written on the character rather than left only in ctiveWindows because that
+table is keyed by Player and so has no entry for the sparring rig, which the
+engine must gate too. The attribute's lifetime is the model's, so nothing leaks
+on PlayerRemoving - the Day 6 invariant 2 argument, in a third place now.
+
+Absolute and server-written, so a client cannot claim a swing to suppress its
+own recovery: the value is this side's os.clock() plus the frame data's own
+Active duration and grace.
+]]
+local attackerCharacter = player.Character
+if attackerCharacter ~= nil then
+attackerCharacter:SetAttribute(ACTIVE_STATE_ATTRIBUTE, now + data.ActiveDuration + ACTIVE_WINDOW_GRACE)
+end
+
+activeWindows[player] = {
+HitIndex = hitIndex,
+ExpiresAt = now + data.ActiveDuration + ACTIVE_WINDOW_GRACE,
+}
 end)
 
 --[[
@@ -981,6 +1063,22 @@ end)
 local function seedPosture(character: Model)
 	ensurePosture(character)
 	closeParryWindow(character)
+
+	--[[
+		Day 8 - Part 1/2: seed the recovery pair here too, for the same reason the
+		pool is seeded at all. `PostureEngine` repairs both on its first tick
+		regardless, so this is not about correctness - it is that a character which
+		spent its first half second with a nil `RoninPostureBroken` is a character
+		whose HUD, on Part 2/2, would have to handle "absent" separately from "false",
+		and the two readings would drift the first time one was written and the other
+		was not.
+
+		`0` is the correct seed for the stamp: it reads as "infinitely long ago" to
+		the grace test, which is the truth for a body that has never been hit.
+	]]
+	character:SetAttribute(POSTURE_BROKEN_ATTRIBUTE, false)
+	character:SetAttribute(POSTURE_LAST_HIT_ATTRIBUTE, 0)
+	character:SetAttribute(ACTIVE_STATE_ATTRIBUTE, 0)
 end
 
 local function bindPlayerPosture(player: Player)
@@ -1015,4 +1113,4 @@ Players.PlayerRemoving:Connect(function(player: Player)
 	parryRung[player] = nil
 end)
 
-print("[SERVER] HitValidator online: RegisterHitEvent, AttackStateEvent, GuardStateEvent, GuardClashEvent, GuardBreakEvent, ParryResultEvent, ComboBreakEvent and DeflectClashEvent are live.")
+print("[SERVER] HitValidator online: RegisterHitEvent, AttackStateEvent, GuardStateEvent, GuardClashEvent, GuardBreakEvent, ParryResultEvent, ComboBreakEvent, DeflectClashEvent and ChaosTestEvent are live.")

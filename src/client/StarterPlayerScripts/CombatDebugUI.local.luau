@@ -1,37 +1,13 @@
 --!strict
 
---[[
-	CombatDebugUI
-	Ronin — The Last Blade · combat debug HUD + keyboard harness
-
-	Builds a minimalist dark status card in the top-left corner that mirrors the client
-	state machine owned by CombatController (reached through CombatStateBus):
-	  * current state badge, colour coded per COMBAT_SPEC state
-	  * previous state
-	  * milliseconds spent in the current state (updated every RenderStepped)
-	  * Day 4: COMBO: [ HIT x / 3 ], the live position in the 3-hit chain, lit while
-	    a swing is in flight and dim while the character is actionable
-	  * feed of the last four transitions
-
-	Directly beneath it sits the Day 3 Input Telemetry panel, which watches the live
-	InputBuffer slot:
-	  * BUFFERED: [ NONE ] in grey, or [ LIGHT_ATTACK ] in cyan while an intent waits
-	  * a countdown bar plus an `XXX ms` readout of the tolerance window remaining
-	  * a rolling feed of the last three consumed inputs and their latency deltas
-
-	Keys (game-processed input is ignored, so typing in chat never fires the harness):
-	  [1] Windup then Active     [2] Blocking     [3] Parrying     [4] Stunned
-	  [0] force reset to Idle
-	  [R] chaos burst: 100 random transition requests inside a single frame
-	  [T] Day 3 chaos suite: the three input buffer invariants (spam, expiry, flush)
-]]
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 
 local CombatTypes = require(ReplicatedStorage.CombatTypes)
+local AttackConfig = require(ReplicatedStorage.AttackConfig)
 local CombatStateBus = require(script.Parent:WaitForChild("CombatStateBus") :: ModuleScript)
 local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleScript)
 local InputGate = require(script.Parent:WaitForChild("InputGate") :: ModuleScript)
@@ -70,6 +46,118 @@ local TEXT_DIM = Color3.fromRGB(142, 148, 160)
 local TEXT_BRIGHT = Color3.fromRGB(236, 238, 244)
 local COLOR_CYAN = Color3.fromRGB(54, 206, 214)
 local BAR_BG_COLOR = Color3.fromRGB(34, 36, 44)
+
+--[[
+	Day 8 Part 2/2: the Sekiro dual-bar status display.
+	
+	Why a dedicated block and not another row on the status card: this is the
+	first element in the HUD meant to be read mid-fight rather than while
+	debugging, and the two jobs want opposite treatments. Telemetry is dense,
+	small and text-heavy because it is read once while stationary; a combat
+	gauge has to be legible at a glance from the centre of the screen while
+	the player is watching an opponent. Keeping them apart lets the gauge be
+	large, low-contrast and bottom-anchored without fighting the card for
+	attention.
+	
+	Sekiro specifically, because posture is the resource this whole system is
+	about. In Sekiro health is not the thing you watch - it barely moves. What
+	you watch is posture, and the bar that matters is the one that fills. So the
+	posture bar here is the wide, prominent one directly under the health bar,
+	and the colour ramp is the whole read: orange means the guard is holding,
+	deep red means it is about to shatter.
+]]
+local VITAL_WIDTH = 320
+local VITAL_HEIGHT = 10
+local POSTURE_HEIGHT = 8
+local VITAL_GAP = 6
+local VITAL_MARGIN = 28
+
+--[[
+	Health and posture tween times, in seconds.
+	
+	Health is slow enough to read as a deliberate drain and fast enough that a
+	hit is legible as it lands. Quad/Out decelerates into the new value, which
+	is what makes a big chunk of damage feel heavy: the bar races down and then
+	settles instead of sliding linearly and reading as regeneration.
+	
+	Posture is deliberately faster. Posture climbs in discrete hits and falls
+	on a server-driven recovery curve, so a slow tween would lag behind the
+	thing the player has to react to, and the 85% warning depends on the bar
+	reaching its target before the next hit.
+]]
+local HEALTH_TWEEN_TIME = 0.28
+local POSTURE_TWEEN_TIME = 0.12
+
+--[[
+	Above this fraction of the posture pool, the critical warning fires.
+	
+	85% rather than 100% is the entire reason the warning is worth having. By
+	the time a pool is actually full the rupture has happened and the player is
+	on the floor; what they need is a moment of warning during which they can
+	still choose to disengage. At 16/sec recovery that is roughly 15% of a
+	pool of slack - long enough to matter against a fast attacker, short
+	enough not to be permanently on for a player who guards a lot.
+]]
+local CRITICAL_POSTURE_THRESHOLD = 0.85
+
+--[[
+	Critical pulse timing.
+	
+	A two-state flash reads as a strobe and is genuinely unpleasant to look
+	at for three seconds. Sekiro pulses rather than strobes: the bar surges
+	brighter and holds for longer than it dims, so the eye picks up a rhythm
+	rather than a flicker. Reverses = true with RepeatCount = -1 gives exactly
+	that on one tween, and a single looping tween is one object for the whole
+	warning rather than a task.spawn loop that has to be cancelled on
+	teardown.
+]]
+local PULSE_PEAK_TIME = 0.16
+local PULSE_TROUGH_TIME = 0.34
+
+--[[
+	Damage tier thresholds for the health bar colour.
+	
+	Half and a quarter, the two boundaries every action game in the genre
+	uses, and the same 0.75/0.25 pair PostureEngine already splits recovery
+	rates on. Sharing the numbers is not cosmetic: the bar turns gold at the
+	exact health value at which the character stops recovering posture at
+	full rate, so a player who can see the bar change knows why their guard
+	stopped healing.
+]]
+local HEALTH_MID_THRESHOLD = 0.5
+local HEALTH_LOW_THRESHOLD = 0.25
+
+--[[
+	The posture colour ramp endpoints, and the three health tier colours.
+	
+	The ramp is a straight Color3:Lerp driven by the pool fraction, so every
+	value between the endpoints is a real reachable colour rather than three
+	discrete states - a player at 60% can see 60% and know it, which is the
+	information the whole posture war is played on. A three-step tier system
+	would throw that away.
+	
+	The health tiers are the opposite decision, and equally deliberate: three
+	named colours rather than a gradient, because a green-to-red gradient
+	passes through a muddy olive that means nothing to the player. The read
+	is "which state am I in", not "how green is my bar".
+]]
+local POSTURE_COLOR_CALM = Color3.fromRGB(255, 150, 40)
+local POSTURE_COLOR_BROKEN = Color3.fromRGB(196, 24, 32)
+local HEALTH_COLOR_HEALTHY = Color3.fromRGB(46, 204, 113)
+local HEALTH_COLOR_WOUNDED = Color3.fromRGB(232, 190, 60)
+local HEALTH_COLOR_CRITICAL = Color3.fromRGB(214, 45, 45)
+
+--[[
+	Vignette geometry. The warning is a frame around the play area rather than
+	a full-screen wash, because a full-screen tint at meaningful opacity
+	makes the incoming attack - the thing the player needs to see - harder
+	to read. A gradient transparent in the middle and saturated at the edges
+	costs nothing where the fight is and puts the warning exactly where
+	peripheral vision picks it up.
+]]
+local VIGNETTE_THICKNESS = 120
+local VIGNETTE_PEAK_TRANSPARENCY = 0.55
+local VIGNETTE_TROUGH_TRANSPARENCY = 0.95
 
 -- Construction ------------------------------------------------------------------
 local function createLabel(
@@ -360,6 +448,468 @@ for index = 1, 3 do
 	consumedRows[index] = row
 end
 
+-- Sekiro vital bars (Day 8 Part 2/2) ----------------------------------------
+--[[
+	The gauge is built bottom-anchored and centred, the way Sekiro puts its own
+	posture bar. Two Frames per bar rather than an ImageLabel: a Frame with a
+	UICorner and a tweened Size is the whole bar, and using a Frame instead of
+	a textured image means the fill colour is a real interpolated Color3 the
+	posture ramp can drive directly, rather than a colour multiplied over an
+	asset.
+	
+	The container is a transparent Frame - a positioning parent, not a visual.
+	Giving it a background would put an opaque plate behind the gauge that the
+	rest of the HUD does not use.
+]]
+local vitalsRoot = Instance.new("Frame")
+vitalsRoot.Name = "SekiroVitals"
+vitalsRoot.BackgroundTransparency = 1
+vitalsRoot.BorderSizePixel = 0
+vitalsRoot.AnchorPoint = Vector2.new(0.5, 1)
+vitalsRoot.Position = UDim2.new(0.5, 0, 1, -VITAL_MARGIN)
+vitalsRoot.Size = UDim2.fromOffset(VITAL_WIDTH, VITAL_HEIGHT + VITAL_GAP + POSTURE_HEIGHT)
+vitalsRoot.Parent = screenGui
+
+--[[
+	One bar: a dark recessed track and a bright fill that gets tweened.
+]]
+local function createBar(
+	parent: Instance,
+	name: string,
+	height: number,
+	offsetY: number,
+	radius: number
+): (Frame, Frame)
+		local track = Instance.new("Frame")
+					track.Name = name .. "Track"
+					track.BackgroundColor3 = BAR_BG_COLOR
+					track.BorderSizePixel = 0
+					track.Position = UDim2.fromOffset(0, offsetY)
+					track.Size = UDim2.new(1, 0, 0, height)
+					track.Parent = parent
+		local trackCorner = Instance.new("UICorner")
+					trackCorner.CornerRadius = UDim.new(0, radius)
+					trackCorner.Parent = track
+
+		local fill = Instance.new("Frame")
+					fill.Name = "Fill"
+					fill.BackgroundColor3 = HEALTH_COLOR_HEALTHY
+					fill.BorderSizePixel = 0
+					fill.Size = UDim2.fromScale(1, 1)
+					fill.Parent = track
+
+		--[[
+			The fill corner is slightly rounder than the track, not the same radius.
+			
+			The fill is clipped by the track anyway, but as the bar drains its rounded
+			outer edge sits inside the track edge, and matching radii makes the
+			shrinking end look slightly clipped. A fill radius one pixel larger reads
+			as a clean rounded cap at every fill level, which is most of what makes
+			the bar look designed rather than scaled.
+			]]
+		local fillCorner = Instance.new("UICorner")
+					fillCorner.CornerRadius = UDim.new(0, radius + 1)
+					fillCorner.Parent = fill
+
+		return track, fill
+end
+
+local healthTrack, healthFill = createBar(vitalsRoot, "Health", VITAL_HEIGHT, 0, 2)
+local postureTrack, postureFill = createBar(vitalsRoot, "Posture", POSTURE_HEIGHT, VITAL_HEIGHT + VITAL_GAP, 2)
+
+--[[
+	A hairline tick marking the exact 85% critical point on the posture track.
+	
+	The pulse tells the player they are past the line but never where the line
+	is, so a pool sitting at 84% for ten seconds looks identical to one
+	climbing through it. A 1px tick at a fixed offset turns "nearly full" into
+	a legible measurement, which is the difference between a warning the player
+	can anticipate and one they can only react to.
+]]
+local criticalTick = Instance.new("Frame")
+criticalTick.Name = "CriticalTick"
+criticalTick.BackgroundColor3 = TEXT_BRIGHT
+criticalTick.BackgroundTransparency = 0.45
+criticalTick.BorderSizePixel = 0
+criticalTick.AnchorPoint = Vector2.new(0, 0.5)
+criticalTick.Position = UDim2.fromScale(CRITICAL_POSTURE_THRESHOLD, 0)
+criticalTick.Size = UDim2.new(0, 1, 1, 0)
+criticalTick.ZIndex = 2
+criticalTick.Parent = postureTrack
+
+-- State painting ---------------------------------------------------------------
+--[[
+	The critical warning vignette.
+	
+	Four edge strips rather than one full-screen wash, because a UIGradient on
+	a full-screen Frame can only fade along one axis. Four strips - each with a
+	gradient running from saturated at the screen edge to fully transparent
+	inboard - give a radial-looking frame out of four linear gradients, and
+	leave the centre of the screen completely untouched.
+	
+	The strips are parented to the HUD ScreenGui but drawn beneath the debug
+	cards by ZIndex, so the warning can never cover the state badge: during a
+	rupture the player needs to read that they are STUNNED, and an opaque red
+	flash over it would be exactly wrong.
+	
+	Active = false matters. These cover the whole screen, and an active one
+	would swallow every click for as long as the warning is up.
+]]
+local vignette = Instance.new("Frame")
+vignette.Name = "CriticalVignette"
+vignette.BackgroundTransparency = 1
+vignette.BorderSizePixel = 0
+vignette.Size = UDim2.fromScale(1, 1)
+vignette.Active = false
+vignette.Visible = false
+vignette.ZIndex = 1
+vignette.Parent = screenGui
+
+--[[
+	One edge strip. Rotation picks which edge and therefore which way the
+	gradient runs: 0 fades downward from the top, 180 upward from the
+	bottom, and the two sides use 90 and 270. The keypoints always run
+	transparent-to-opaque along the rotation, so one pair serves all four.
+]]
+local function createVignetteEdge(rotation: number, position: UDim2, size: UDim2): Frame
+		local edge = Instance.new("Frame")
+					edge.Name = "Edge"
+					edge.BackgroundColor3 = POSTURE_COLOR_BROKEN
+					edge.BackgroundTransparency = VIGNETTE_TROUGH_TRANSPARENCY
+					edge.BorderSizePixel = 0
+					edge.Position = position
+					edge.Size = size
+					edge.Active = false
+					edge.Parent = vignette
+
+		local gradient = Instance.new("UIGradient")
+					gradient.Rotation = rotation
+					gradient.Transparency = NumberSequence.new({
+						NumberSequenceKeypoint.new(0, 0),
+						NumberSequenceKeypoint.new(1, 1),
+					})
+					gradient.Parent = edge
+
+		return edge
+end
+
+--[[
+	The edges are held in a list because the pulse has to animate all four
+	and a Tween addresses exactly one instance. Building them through one
+	function that returns the frame keeps each edge's geometry next to the
+	gradient setup it belongs with.
+]]
+local vignetteEdges: { Frame } = {
+		createVignetteEdge(0, UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, VIGNETTE_THICKNESS)),
+		createVignetteEdge(180, UDim2.new(0, 0, 1, -VIGNETTE_THICKNESS), UDim2.new(1, 0, 0, VIGNETTE_THICKNESS)),
+		createVignetteEdge(90, UDim2.fromOffset(0, 0), UDim2.new(0, VIGNETTE_THICKNESS, 1, 0)),
+		createVignetteEdge(270, UDim2.new(1, -VIGNETTE_THICKNESS, 0, 0), UDim2.new(0, VIGNETTE_THICKNESS, 1, 0)),
+}
+
+-- Vital bar painting (Day 8 Part 2/2) -------------------------------------------
+--[[
+	The tween in flight on each fill, and the value it is heading for.
+	
+	Both are tracked rather than re-tweened blindly every frame, for one
+	reason: TweenService:Create allocates a Tween object, and creating one
+	per bar per frame is 120 allocations a second for an animation that is
+	usually not moving. The loop compares the current value against the
+	target and only builds a tween when the target actually moved, which on
+	most frames means returning before TweenService is ever called.
+	
+	The stored Tween doubles as the cancellation token. Starting a new tween
+	on the same property would stop the old one anyway, but the explicit
+	Cancel makes the intent unambiguous and stops a stale tween landing a
+	frame late and overwriting the new value.
+]]
+local healthTween: Tween? = nil
+local postureTween: Tween? = nil
+local healthTarget = 1.0
+local postureTarget = 0.0
+
+--[[
+	The critical warning state: the looping edge tweens, the bar tween, and a
+	single flag that is the whole truth about whether the warning is running.
+	
+	Handles rather than a task.spawn loop with a running flag, so there is
+	exactly one thing to cancel and no timer that can outlive the character
+	or a HUD rebuild. Each stop path checks PlaybackState before cancelling,
+	so teardown is idempotent and is reached both by falling below the
+	threshold and by the render loop noticing the character went away.
+]]
+local pulseTweens: { Tween } = {}
+local barPulseTween: Tween? = nil
+local warningActive = false
+
+--[[
+	The health tier colour for a fraction of max health.
+	
+	Three named tiers rather than a gradient from green to red, deliberately.
+	A gradient passes through a muddy olive that means nothing to the player,
+	whereas three distinct colours are three distinct pieces of information.
+	The read is "which state am I in", not "how green is my bar".
+]]
+local function healthColorFor(fraction: number): Color3
+		if fraction < HEALTH_LOW_THRESHOLD then
+			return HEALTH_COLOR_CRITICAL
+		end
+
+		if fraction < HEALTH_MID_THRESHOLD then
+			return HEALTH_COLOR_WOUNDED
+		end
+
+		return HEALTH_COLOR_HEALTHY
+end
+
+--[[
+	Retargets a bar, tweening only when the destination actually changed. The
+	earlier return is the allocation guard described above.
+]]
+local function retargetBar(
+		fill: Frame,
+		fraction: number,
+		duration: number,
+		previousTarget: number,
+		activeTween: Tween?
+): Tween?
+		if math.abs(fraction - previousTarget) < 0.001 then
+			return activeTween
+		end
+
+		if activeTween ~= nil then
+			activeTween:Cancel()
+		end
+
+		local tween = TweenService:Create(
+			fill,
+			TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ Size = UDim2.fromScale(math.clamp(fraction, 0, 1), 1) }
+		)
+		tween:Play()
+
+		return tween
+end
+
+
+-- State painting ---------------------------------------------------------------
+--[[
+	Starts or stops the critical warning.
+	
+	One function owns the whole warning rather than a start and a stop, so
+	the warningActive flag is the single source of truth and there is no second
+	boolean that can disagree with it.
+	
+	The cycle is the sum of the two times: Reverses plays the tween forward and
+	then backward, and the backward leg takes the same time, so the peak
+	occupies PULSE_PEAK_TIME of the cycle and the trough the rest. That is the
+	asymmetry the surge-and-hold rhythm depends on.
+	
+	Two separate animated targets, because the bar has to be readable from the
+	centre of the screen where the vignette is fully transparent by
+	construction. Without the bar brightening, a player whose eyes are on
+	their own character would see no warning at all until they happened to
+	glance at the screen edges.
+]]
+local function setCriticalWarning(active: boolean)
+		if active then
+			if warningActive then
+				return
+			end
+
+			vignette.Visible = true
+
+			local pulseInfo = TweenInfo.new(
+				PULSE_PEAK_TIME + PULSE_TROUGH_TIME,
+				Enum.EasingStyle.Sine,
+				Enum.EasingDirection.InOut,
+				-1,
+				true,
+				0
+			)
+
+			--[[ 
+				The four edges are tweened individually rather than through the parent.
+				The parent is a fully transparent container by design, so animating its
+				BackgroundTransparency does nothing at all - the visible property on
+				each edge is its own, and each edge carries the UIGradient that makes it
+				a vignette rather than a flat strip.
+				Four tweens because a Tween addresses one instance. They share a
+				single TweenInfo, so they stay in lockstep, and the handles are
+				kept in a list so the stop path can cancel all four.
+			]]
+
+			pulseTweens = {}
+			for _, edge in ipairs(vignetteEdges) do
+				local edgeTween = TweenService:Create(
+					edge,
+					pulseInfo,
+					{ BackgroundTransparency = VIGNETTE_PEAK_TRANSPARENCY }
+				)
+				edgeTween:Play()
+				table.insert(pulseTweens, edgeTween)
+			end
+
+			--[[
+				The bar pulses between the colour the ramp already produced and a
+				brightened version of it.
+				
+				The start value is read from the live fill rather than recomputed:
+				the render loop has already written the ramp colour for this exact
+				pool fraction, so the property is guaranteed to be the colour the
+				player was already looking at.
+				
+				It matters that this reverses between two *different* colours. A
+				tween that simply ended on one fixed colour and reversed would
+				arrive there once and sit still, because reversing plays the same
+				interpolation backwards from the same endpoint - there is no second
+				colour to travel between.
+				
+				The highlight is the live bar colour pushed toward white, so the
+				pulse gets brighter as the pool fills rather than being a fixed
+				shade: at 85% it is a deep red flare, at 99% nearly white, which is
+				the reading that tells the player the break is no longer a maybe.
+			]]
+			barPulseTween = TweenService:Create(
+				postureFill,
+				pulseInfo,
+				{ BackgroundColor3 = postureFill.BackgroundColor3:Lerp(Color3.new(1, 1, 1), 0.55) }
+			)
+			barPulseTween:Play()
+
+			warningActive = true
+			return
+		end
+
+		--[[ 
+			Falling below the threshold. Every tween in the warning is cancelled, not
+			just the bar, and vignette.Visible goes false on the same path - a
+			cancelled edge tween leaves that strip at a partial transparency, and a
+			half-faded strip left visible would be a permanently dim red border for
+			the rest of the session.
+		]]
+		if not warningActive then
+			return
+		end
+
+		for _, edgeTween in ipairs(pulseTweens) do
+			if edgeTween.PlaybackState ~= Enum.PlaybackState.Completed then
+				edgeTween:Cancel()
+			end
+		end
+
+		pulseTweens = {}
+
+		if barPulseTween ~= nil then
+			if barPulseTween.PlaybackState ~= Enum.PlaybackState.Completed then
+				barPulseTween:Cancel()
+			end
+			barPulseTween = nil
+		end
+
+		warningActive = false
+		vignette.Visible = false
+end
+
+-- State painting ---------------------------------------------------------------
+--[[
+	The per-frame vital update.
+	
+	Called from the existing RenderStepped connection rather than from a second
+	one. Two render connections servicing different things is two things that
+	can disagree about ordering, and the gauge would sit a frame behind the
+	state badge above it for no reason. One loop, one place where a frame is
+	serviced.
+	
+	No character means an empty gauge rather than stale values. A HUD still
+	showing the last life's health during a respawn is a small lie that costs
+	the player the half-second it takes to notice their new body is full.
+	
+	The posture colour is a straight Lerp applied every frame with no tween,
+	and that is the one thing here deliberately not tweened. Colour is a
+	continuous read of a continuous value, and a tween on it would lag the
+	bar it is describing. The size is tweened so a discrete hit reads as
+	impact; the colour tracks instantly so the bar is never a different
+	colour from the number it represents.
+]]
+local function updateVitals()
+	local character = player.Character
+	local humanoid = if character ~= nil then character:FindFirstChildOfClass("Humanoid") else nil
+
+	if character == nil or humanoid == nil then
+		setCriticalWarning(false)
+		healthTarget = 1.0
+		postureTarget = 0.0
+		healthFill.BackgroundColor3 = healthColorFor(1.0)
+		postureFill.BackgroundColor3 = POSTURE_COLOR_CALM
+		return
+	end
+
+	--[[ 
+		Health. MaxHealth is read every frame rather than cached: it is one
+		property read on a local object, and a cached copy would be another
+		value to invalidate correctly if anything ever changed a character's
+		max health. The division is guarded because a MaxHealth of 0 is
+		representable and would produce a NaN width.
+]]
+	local maxHealth = humanoid.MaxHealth
+	local healthFraction = if maxHealth > 0 then math.clamp(humanoid.Health / maxHealth, 0, 1) else 1
+
+	--[[ 
+		Posture. Both attributes are server-written and both are seeded by
+		PostureEngine and HitValidator on the first heartbeat, so a nil here is a
+		character alive for less than a frame. The fallbacks keep the arithmetic
+		total and the bar shows 0, which is the truth for a character that has
+		not been given a pool yet.
+]]
+	local postureValue = character:GetAttribute(AttackConfig.POSTURE_ATTRIBUTE)
+
+	local maxPostureValue = character:GetAttribute(AttackConfig.MAX_POSTURE_ATTRIBUTE)
+
+
+	local maxPosture = if typeof(maxPostureValue) == "number" and maxPostureValue > 0
+		then maxPostureValue
+
+		else AttackConfig.MAX_POSTURE
+	local posture = if typeof(postureValue) == "number"
+
+		then math.clamp(postureValue / maxPosture, 0, 1)
+		else 0
+
+	healthTween = retargetBar(healthFill, healthFraction, HEALTH_TWEEN_TIME, healthTarget, healthTween)
+	healthTarget = healthFraction
+
+	postureTween = retargetBar(postureFill, posture, POSTURE_TWEEN_TIME, postureTarget, postureTween)
+	postureTarget = posture
+
+	--[[ 
+		The health colour is written every frame, unconditionally. A ternary
+		would skip the write when the tier is unchanged, saving a property set
+		Roblox would almost certainly no-op anyway - and the no-op case is
+		exactly when the posture pulse is running and needs the write
+		re-asserted, so the unconditional form is both simpler and more correct.
+]]
+	healthFill.BackgroundColor3 = healthColorFor(healthFraction)
+
+	--[[ 
+		The ramp colour, but only while the pulse is not driving the bar. A
+		looping tween owns its target property outright, so writing here every
+		frame would fight it and produce a visible stutter at exactly the moment
+		the warning needs to be most legible.
+]]
+	if not warningActive then
+		postureFill.BackgroundColor3 = POSTURE_COLOR_CALM:Lerp(POSTURE_COLOR_BROKEN, posture)
+	end
+
+	--[[ 
+		The critical threshold is compared against the *target* fraction, not
+		the drawn width. The fill is tweening toward the value, so a bar that
+		has only just crossed 85% is still drawn below it - testing the width
+		would delay the warning by the tween time on every crossing, which at
+		0.12s is enough to matter.
+]]
+	setCriticalWarning(posture > CRITICAL_POSTURE_THRESHOLD)
+end
+
 -- State painting ---------------------------------------------------------------
 local paintedState: CombatState? = nil
 
@@ -417,6 +967,18 @@ local function paintComboState(inSwing: boolean)
 end
 
 RunService.RenderStepped:Connect(function()
+	--[[ 
+		Day 8 Part 2/2: the gauge is serviced first and unconditionally.
+
+		It sits above the early-out below, which returns as soon as no machine
+		is bound. That early-out is right for the telemetry panels - there is no
+		state to report without a machine - but the gauge reads a Humanoid and
+		a model's attributes, both of which exist independently of the state
+		machine. A character that is alive but has no bound machine (a respawn
+		in flight) should still show its health.
+	]]
+	updateVitals()
+
 	local machine = CombatStateBus.GetActiveMachine()
 
 	if not machine then
@@ -681,6 +1243,234 @@ local function runInputChaosSuite()
 	end
 end
 
+--[[ 
+	Day 8 Chaos Suite: posture rupture verification. Bound to Key [Y].
+	
+	The suite is split across the two halves of the game, because the two Day 8
+	invariants live on opposite sides of the wire:
+	
+	  (a) Posture Edge  - a 99.9% pool plus a 0.2% poise hit must break. This is
+			the server's decision, so PostureChaos runs it there and answers over
+			REMOTE_CHAOS_EVENT.
+	
+	  (b) Death Override - HP to 0 mid-rupture must cleanly override Stunned and
+			destroy the listeners. The server half runs there too; the *listener*
+			half is checked here, against the real bound machine, because only this
+			client knows whether its own Died handler ran.
+	
+	The remote is resolved at press time rather than at load, for the same reason
+	PostureChaos resolves it lazily: the server creates the remotes inside
+	HitValidator's body, so a lookup performed while this LocalScript starts
+	would be a race against a remote that may not exist yet.
+]]
+local chaosSuiteRunning = false
+
+--[[ 
+	How long the client waits for the server's verdict.
+	
+	Generous, because test (b) genuinely waits on the engine's respawn: the
+	server holds the run open for up to 15s. A tighter client timeout would
+	report a false failure on a slow respawn while the server later replies
+	successfully. Being slow to fail is strictly better than being wrong.
+]]
+local CHAOS_REPLY_TIMEOUT = 25.0
+local CHAOS_POLL_STEP = 0.05
+
+--[[ 
+	The client's half of (b).
+	
+	After the death the bus must hold a *new* machine for the new character, in
+	Idle, with no stale freeze. The old machine is unreachable by design
+	(teardown drops it), so this checks observable state rather than the
+	retired object - which is the only version of the check that survives the
+	object being collected.
+]]
+local function verifyClientTeardown()
+		local machine = CombatStateBus.GetActiveMachine()
+		if machine == nil then
+			return false, "no machine bound after the respawn"
+		end
+
+		if machine.CurrentState ~= "Idle" then
+			return false, "the new machine did not start Idle"
+		end
+
+		--[[ 
+			The freeze must not have survived the death. CombatController's teardown
+			clears this flag, and a stun *release* also clears it, so the assertion
+			is only meaningful because the character died before the 3.0s rupture
+			could expire - which is exactly the case under test.
+			]]
+		if CombatStateBus.IsStunInputLocked() then
+			return false, "the stun input lock leaked past the death"
+		end
+
+		--[[ 
+			The machine must still answer questions. A listener left connected to a dead
+			machine would leave the new one fine and the old one broken, and this is
+			the cheapest way to prove the new binding is a live machine rather than a
+			husk.
+			]]
+		local canTransition = machine:CanTransitionTo("Blocking")
+		if type(canTransition) ~= "boolean" then
+			return false, "the new machine no longer answers CanTransitionTo"
+		end
+
+		return true, "new machine bound, Idle, lock cleared, responsive"
+end
+
+--[[ 
+	Runs the Day 8 suite.
+	
+	Input is gated for the duration for the reason documented on InputGate: the
+	suite kills the player, and a live Mouse1 press landing during the respawn
+	would be spent by the new character's first Idle handler and read by the
+	teardown assertion as a leaked input.
+	
+	The server result is awaited with a poll rather than a promise because this
+	file is a plain LocalScript with no async runtime to bridge into. The poll
+	costs one task.wait per iteration and exits the frame it hears back.
+]]
+local function runPostureChaosSuite()
+		if chaosSuiteRunning then
+			warn("[POSTURE CHAOS] A run is already in flight; press ignored.")
+			return
+		end
+
+		if CombatStateBus.GetActiveMachine() == nil then
+			warn("[POSTURE CHAOS] Skipped: no state machine bound (is the character alive?)")
+			return
+		end
+
+		local chaosEvent = ReplicatedStorage:FindFirstChild(AttackConfig.REMOTE_CHAOS_EVENT) :: RemoteEvent?
+		if chaosEvent == nil then
+			warn("[POSTURE CHAOS] ChaosTestEvent not found; is PostureChaos running on the server?")
+			return
+		end
+
+		chaosSuiteRunning = true
+		InputGate.Set(true)
+
+		--[[ 
+			The server's verdict lands here. Declared before the FireServer so there
+			is no window in which a fast reply could arrive with nowhere to go,
+			which would hang the poll until its timeout on a perfectly good run.
+			]]
+		local serverResults: { unknown }? = nil
+		local connection = chaosEvent.OnClientEvent:Connect(function(payload: unknown)
+			if typeof(payload) == "table" then
+				serverResults = payload :: { unknown }
+			end
+		end)
+
+		print("[POSTURE CHAOS] Day 8 suite starting. This will kill the character; wait for the respawn.")
+		chaosEvent:FireServer()
+
+		--[[ 
+			The wait. A deadline is compared rather than counted down so there is no
+			accumulator to drift, and the client-side teardown assertion is
+			deliberately not attempted until the server has confirmed the respawn
+			happened - running it earlier would assert against a dead character.
+			]]
+		local deadline = os.clock() + CHAOS_REPLY_TIMEOUT
+		while serverResults == nil and os.clock() < deadline do
+			task.wait(CHAOS_POLL_STEP)
+		end
+
+		--[[ 
+			Hand the input back and drop the listener however the run ended, before
+			any reporting. A reporting bug must not be able to leave the player
+			without input.
+			]]
+		connection:Disconnect()
+		InputGate.Set(false)
+		chaosSuiteRunning = false
+
+		if serverResults == nil then
+			error(string.format("[POSTURE CHAOS] FAILED: no server verdict after %.0fs", CHAOS_REPLY_TIMEOUT))
+			return
+		end
+
+		--[[ 
+			Every server record is schema-checked before it is read
+			(ARCHITECTURE.md #2), and a record that fails the check counts as a
+			failure rather than being skipped - a malformed verdict is not a pass.
+			]]
+		local allPassed = true
+		for _, entry in ipairs(serverResults) do
+			if type(entry) ~= "table" then
+				allPassed = false
+				warn("[POSTURE CHAOS] FAILED: malformed server verdict (not a table).")
+				break
+			end
+
+			local record = entry :: { Name: unknown, Passed: unknown, Detail: unknown }
+			if type(record.Name) ~= "string" or type(record.Passed) ~= "boolean" or type(record.Detail) ~= "string" then
+				allPassed = false
+				warn("[POSTURE CHAOS] FAILED: malformed server verdict (bad field types).")
+				break
+			end
+
+			print(string.format("[POSTURE CHAOS] %s %s -- %s",
+				if record.Passed then "PASS" else "FAIL",
+				record.Name,
+				record.Detail))
+
+			if not record.Passed then
+				allPassed = false
+			end
+		end
+
+		--[[ 
+			The client's half of (b). The death has already happened and the server
+			has already waited for the respawn, so the new binding is in place.
+			]]
+		--[[
+		The client's half of (b).
+
+		The server has already confirmed the respawn by the time its verdict
+		arrives, but the client's own binding is a separate CharacterAdded callback
+		on this client, and it can land a frame or two after the server observes the
+		new model. Asserting the instant the verdict lands therefore reads "no
+		machine bound" on a run that is entirely correct, which is exactly what
+		verifyClientTeardown reported on the first clean pass.
+
+		A short settle is the honest fix. It is not a masking sleep: the wait is for
+		a callback that is guaranteed to run, not for a condition that may never
+		become true, and the assertions behind it stay strict.
+	]]
+	for _settle = 1, 20 do
+		if CombatStateBus.GetActiveMachine() ~= nil then
+			break
+		end
+		task.wait(CHAOS_POLL_STEP)
+	end
+
+	local clientOk, clientDetail = verifyClientTeardown()
+		print(string.format("[POSTURE CHAOS] %s Client Teardown -- %s",
+			if clientOk then "PASS" else "FAIL",
+			clientDetail))
+
+		if not clientOk then
+			allPassed = false
+		end
+
+		--[[ 
+			Leave the harness clean. A forced Idle means the next [Y] starts from a
+			known place rather than from whatever this run left behind, which is
+			what makes a second run meaningful after a first one failed.
+			]]
+		CombatStateBus.ForceResetToIdle()
+		InputBuffer.Clear()
+
+		if allPassed then
+			print("[POSTURE CHAOS] All Day 8 invariants verified cleanly.")
+			return
+		end
+
+		error("[POSTURE CHAOS] FAILED: see the per-invariant lines above.")
+end
+
 UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessedEvent: boolean)
 	if gameProcessedEvent then
 		return
@@ -700,6 +1490,22 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessedEv
 
 	if keyCode == Enum.KeyCode.T then
 		task.spawn(runInputChaosSuite)
+		return
+	end
+
+	--[[ 
+		Day 8 Part 2/2: the posture rupture suite.
+
+		Spawned like the [T] suite because it runs for as long as a respawn
+		takes, and a blocking handler would freeze the harness - including the
+		escape hatch of pressing another key. The function owns its own error
+		reporting and always reopens input, so the spawn cannot lose a failure.
+
+		A failed run raises inside a spawned thread, so it surfaces in the output
+		as a script error and cannot take the whole HUD down with it.
+	]]
+	if keyCode == Enum.KeyCode.Y then
+		task.spawn(runPostureChaosSuite)
 		return
 	end
 

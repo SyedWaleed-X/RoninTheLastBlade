@@ -187,6 +187,26 @@ local function onActionInput(action: CombatAction, inputState: Enum.UserInputSta
 	end
 
 	--[[
+		Day 8 · Part 2/2: the stun freeze, enforced at the input edge.
+
+		Checked here, above everything else in this handler, because this is the last
+		point at which a press can be refused without leaving a trace. The alternatives
+		all leak: the machine refuses `Stunned -> Blocking` but the press would still
+		be *queued* by `OfferIntent` and spent by the `Idle` handler the instant the
+		stun expired, which is an attack the player never saw themselves start; and
+		`CombatController` clearing the buffer on the transition is a snapshot, not a
+		lock, so any press landing in the frames after it survives.
+
+		`Pass` rather than `Sink` is deliberate and unchanged from every other refusal
+		in this file: the input is not being consumed, it is being ignored, and the
+		camera and the GUI must keep working while the character is helpless.
+	]]
+	if CombatStateBus.IsStunInputLocked() then
+		print(string.format("[INPUT] Ignored during stun freeze: %s at %.3f", action, os.clock()))
+		return Enum.ContextActionResult.Pass
+	end
+
+	--[[
 		Day 6 · Part 1/2: attacking out of a guard.
 
 		This runs before the normal offer, and it must. `offerIntent` only spends a
@@ -266,6 +286,34 @@ local function onHoldInput(action: CombatAction, inputState: Enum.UserInputState
 		end
 
 		--[[
+			Day 8 · Part 2/2: the stun freeze and the release requirement, on the
+			press edge of the hold.
+
+			Both are read here for the same reason the tap path reads its lock: this is
+			the last moment a press can be refused without a queue entry or a machine
+			transition left behind.
+
+			`IsGuardReleaseRequired` is the "release and re-press Mouse2" rule. It is
+			raised by `CombatController` on the `Stunned -> Idle` wakeup and cleared
+			below by a genuine `End` edge, so a character that woke up with the button
+			still down cannot re-raise its guard until the player lets go. Without it
+			the rupture would end with the player's guard silently back up, which reads
+			as the game ignoring the hit rather than as the player being punished.
+		]]
+		if CombatStateBus.IsStunInputLocked() then
+			print(string.format("[INPUT] Guard press ignored during stun freeze at %.3f", os.clock()))
+			return Enum.ContextActionResult.Pass
+		end
+
+		if CombatStateBus.IsGuardReleaseRequired() then
+			print(string.format(
+				"[INPUT] Guard refused: release Mouse2 and re-press (wakeup rule) at %.3f",
+				os.clock()
+			))
+			return Enum.ContextActionResult.Pass
+		end
+
+		--[[
 			Day 7 · Part 1/2: the press that raises the guard is also the parry press.
 
 			Gated on `action == "Guard"` rather than assumed. The hold path is shared by
@@ -313,6 +361,16 @@ local function onHoldInput(action: CombatAction, inputState: Enum.UserInputState
 
 	-- End and Cancel both mean "the button is no longer down", which is the only thing
 	-- this cares about.
+	--
+	-- Day 8 · Part 2/2: clearing the wakeup requirement lives here, on the
+	-- *unconditional* path rather than inside the `Blocking` test below. The flag means
+	-- "the player owes us a release", and a release is exactly what just arrived —
+	-- whether or not the guard happened to be up when it did. Gating the clear on
+	-- `== "Blocking"` would leave the requirement latched for a player who was hit into
+	-- a stun while guarding (the guard is already down when they let go) and who would
+	-- then be permanently unable to raise it again.
+	CombatStateBus.ClearGuardReleaseRequirement()
+
 	if CombatStateBus.GetCurrentState() == "Blocking" and CombatStateBus.CanRequestState("Idle") then
 		CombatStateBus.RequestState("Idle")
 

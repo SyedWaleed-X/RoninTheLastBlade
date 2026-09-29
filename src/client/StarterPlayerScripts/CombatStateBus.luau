@@ -544,6 +544,64 @@ function bus.GetGuardPose(): GuardPoseHandle?
 end
 
 --[[
+	Day 8 · Part 2/2: the client-side stun freeze, as a shared flag rather than a
+	private variable.
+
+	`CombatController` is the only place that decides the character is frozen, and
+	`InputBinder` is the only place that turns a mouse press into an intent — but the
+	binder is a LocalScript and cannot be required, and the controller has no
+	`UserInputService` connection of its own. The bus is the seam those two already
+	share, so the lock lives here: the controller raises it on the transition into
+	`Stunned`, and the binder refuses every press while it is up.
+
+	The important property is that this is checked at the *input edge*, before
+	`InputBuffer.Push` and before any `RequestState`. A stun that only cleared the
+	queue would still be defeated by a press landing a frame later, because
+	`Stunned -> Blocking` is refused by `ALLOWED_TRANSITIONS` but the press would
+	simply sit in the buffer and be spent the instant the stun expired — a queued
+	attack, fired on wakeup, out of a character that was hit three seconds ago.
+	Refusing at the edge means nothing is ever queued to leak.
+]]
+local stunInputLocked = false
+
+function bus.SetStunInputLock(locked: boolean)
+	stunInputLocked = locked
+end
+
+function bus.IsStunInputLocked(): boolean
+	return stunInputLocked
+end
+
+--[[
+	Day 8 · Part 2/2: "release and re-press" after a rupture.
+
+	`ContextActionService` reports a hold as one `Begin` when the button goes down and
+	one `End` when it comes back up. A player who is still holding Mouse2 when the
+	3.0s rupture expires therefore produces **no new press at all** — the button never
+	left the desk — so the natural behaviour is already "no auto-guard on wakeup".
+
+	This flag makes that guarantee explicit rather than incidental, and it covers the
+	case the natural behaviour misses: a press that arrives in the same frame the stun
+	ends, and the case where the binder's hold is re-entered by a device that reports
+	touch-held actions as a fresh `Begin` on refocus. Either way the flag has to be
+	cleared by an actual `End` before another `Begin` is believed, which is the
+	"release and re-press" rule made into a state the binder can read.
+]]
+local guardReleaseRequired = false
+
+function bus.SetGuardReleaseRequired(value: boolean)
+	guardReleaseRequired = value
+end
+
+function bus.IsGuardReleaseRequired(): boolean
+	return guardReleaseRequired
+end
+
+function bus.ClearGuardReleaseRequirement()
+	guardReleaseRequired = false
+end
+
+--[[
 	Publishes one confirmed blade contact to the hit subscribers. The record itself is
 	built by BladeHitbox at the moment of contact (a handful per swing at most), so
 	this is not on the per-frame path.
