@@ -90,11 +90,12 @@ local Arena = BossConfig.Arena
 --[[
 The hub is a 104x104 plinth centred on the origin whose floor top is y = 1, and
 its four torii stand on a 46-stud ring. That is the only hard geometry this file
-assumes about the hub, and it is all it needs: everything below either starts at
-the hub's edge and grows outward, or is positioned relative to a gate.
+assumes about the hub, and it is all it needs - measured in prose rather than in
+constants, because every region grows outward from the hub's *edge* rather than
+referencing a number of it. Where a region does need the hub's floor height it
+needs its own (the aprons, the basin floor, the docks), and those are written out
+where they are used so that changing them cannot silently move a landmark.
 ]]
-local HUB_HALF: number = 52
-local HUB_FLOOR_TOP: number = 1
 
 --[[
 Every region's ground apron sits 0.1 studs *under* the hub floor and 0.1 under
@@ -1742,10 +1743,17 @@ local function buildWestBasin(parent: Instance)
 			Enum.Material.Slate
 		)
 	end
+	--[[
+	The far bank. `WEST_BASIN_FAR - WEST_APRON_FAR`, not the other way round: every
+	west coordinate is negative and the far bank is the *more* negative one, so the
+	obvious expression evaluates to -54 and a part cannot have a negative size - it
+	silently clamps to 0.05, and 54 studs of far shore quietly disappears back onto
+	the bare `Baseplate`. Caught by raycasting the ground, not by looking at it.
+	]]
 	makePart(
 		parent,
 		"SunkenApron",
-		Vector3.new(WEST_APRON_FAR - WEST_BASIN_FAR + 2, APRON_THICKNESS, WEST_APRON_HALF_Z * 2),
+		Vector3.new(WEST_BASIN_FAR - WEST_APRON_FAR + 2, APRON_THICKNESS, WEST_APRON_HALF_Z * 2),
 		CFrame.new((WEST_BASIN_FAR + WEST_APRON_FAR) * 0.5, APRON_TOP - APRON_THICKNESS * 0.5, 0),
 		COLOR_BASIN_STONE,
 		Enum.Material.Slate
