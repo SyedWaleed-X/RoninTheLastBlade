@@ -83,6 +83,26 @@ local DODGE_IFRAME_DURATION = AttackConfig.DODGE_IFRAME_DURATION
 local DODGE_COOLDOWN = AttackConfig.DODGE_COOLDOWN
 
 --[[
+	Day 10 · Part 1/2: the dodge's posture price, now charged on this side.
+
+	`DodgeController` already knew the cost and already showed it on the gauge, but
+	the write was local (Day 9 invariant 8). Because `RoninPosture` replicates *down*,
+	a local write never travelled up and the server kept its own untouched copy — so
+	the price was honest-looking and unenforceable at the same time. The cost is now
+	deducted here, on the same terms, from the same `AttackConfig` numbers.
+
+	`DODGE_SPAM_MAX_CHAIN` is re-derived here rather than trusted from the client for
+	the same reason `parryRung` is: the ladder is a fact about how fast *this player*
+	is pressing, and a client that could choose its own rung could choose to pay
+	the 10-point price forever. `lastDodgePress` and `dodgePressChain` are keyed by
+	Player and cleared on `PlayerRemoving` for the same reason `parryRung` is.
+]]
+local DODGE_POSTURE_COST = AttackConfig.DODGE_POSTURE_COST
+local DODGE_SPAM_WINDOW = AttackConfig.DODGE_SPAM_WINDOW
+local DODGE_SPAM_COST_STEP = AttackConfig.DODGE_SPAM_COST_STEP
+local DODGE_SPAM_MAX_CHAIN = AttackConfig.DODGE_SPAM_MAX_CHAIN
+
+--[[
 	Day 8 · Part 1/2: the poise stamp, and the `Active` deadline.
 
 	`POSTURE_LAST_HIT_ATTRIBUTE` is written inside `spendPosture` rather than at the
@@ -97,7 +117,6 @@ local DODGE_COOLDOWN = AttackConfig.DODGE_COOLDOWN
 	on its own, so there is no teardown path that can leave it stuck on.
 ]]
 local POSTURE_BROKEN_ATTRIBUTE = AttackConfig.POSTURE_BROKEN_ATTRIBUTE
-local POSTURE_LAST_HIT_ATTRIBUTE = AttackConfig.POSTURE_LAST_HIT_ATTRIBUTE
 local POSTURE_LAST_HIT_ATTRIBUTE = AttackConfig.POSTURE_LAST_HIT_ATTRIBUTE
 local ACTIVE_STATE_ATTRIBUTE = AttackConfig.ACTIVE_STATE_ATTRIBUTE
 
@@ -844,6 +863,53 @@ end)
 ]]
 local lastDodgeRequest: { [Player]: number } = {}
 
+--[[
+	The spam ladder's two pieces of per-player state.
+
+	`lastDodgePress` is the `os.clock()` of the last *accepted* dodge and
+	`dodgePressChain` is how many have come inside `DODGE_SPAM_WINDOW` of each other,
+	capped at `DODGE_SPAM_MAX_CHAIN`. Both are updated only on the granted path, so a
+	player whose dodges are being refused for cooldown is not also advancing a
+	penalty ladder they never reached — "I dodged three times quickly" and "I mashed
+	Q while stunned" have to stay different events.
+]]
+local lastDodgePress: { [Player]: number } = {}
+local dodgePressChain: { [Player]: number } = {}
+
+--[[
+	Charges a granted dodge its posture price, with the spam ladder, on this side.
+
+	Deliberately routed through `spendPosture` rather than open-coded. That helper
+	already does the three things this needs and that a hand-rolled write would have
+	to re-derive: it stamps `POSTURE_LAST_HIT_ATTRIBUTE` so the 1.2s poise grace
+	starts (a dodge is a commitment, and the character should not be regenerating
+	their guard through it), it clamps at `MAX_POSTURE_ATTRIBUTE` so a chain of
+	dodges taken at a near-full pool cannot report 118/100, and it repairs the
+	attributes if they were never written. One writer for "posture went up" is the
+	invariant; a second copy of the clamp is the drift.
+
+	The return value is the *new* pool, which the caller uses to decide whether the
+	dodge itself broke the guard. That is the honest interaction between the two
+	Day 9 rules: `DODGE_POSTURE_LOCKOUT` (90) exists so a single dodge can never
+	cross the line, and this is what happens when a player reaches it anyway by
+	arriving at 95 rather than at 0.
+]]
+local function spendDodgePosture(character: Model, player: Player, now: number): number
+	local lastPress = lastDodgePress[player]
+	if lastPress ~= nil and (now - lastPress) < DODGE_SPAM_WINDOW then
+		local chain = dodgePressChain[player] or 0
+		dodgePressChain[player] = math.min(chain + 1, DODGE_SPAM_MAX_CHAIN)
+	else
+		dodgePressChain[player] = 0
+	end
+	lastDodgePress[player] = now
+
+	local cost = DODGE_POSTURE_COST + (dodgePressChain[player] or 0) * DODGE_SPAM_COST_STEP
+	local nextPosture = spendPosture(character, cost)
+
+	return nextPosture
+end
+
 dodgeEvent.OnServerEvent:Connect(function(player: Player, direction: any)
 	-- 1. Schema ---------------------------------------------------------------
 	if typeof(direction) ~= "Vector3" then
@@ -891,6 +957,45 @@ dodgeEvent.OnServerEvent:Connect(function(player: Player, direction: any)
 	lastDodgeRequest[player] = now
 	character:SetAttribute(INVULNERABLE_ATTRIBUTE, true)
 
+	--[[
+		Day 10 · Part 1/2: the posture price, charged here rather than on the client.
+
+		Placed *after* every rejection above, so a dodged dodge is free. That ordering
+		is the whole correctness of the rule: if this ran before the cooldown and
+		i-frame checks, a player mashing Q while stunned would be ground down to a
+		rupture by presses the server never granted, and `DodgeController`'s client
+		prediction (which only charges the accepted path) would disagree with the
+		gauge the moment the two drifted apart.
+
+		`spendPosture` stamps `RoninLastPostureHitTime`, so the 1.2s poise grace
+		begins on the dodge — the character committed, and should not be recovering
+		their guard through the move.
+	]]
+	local postureAfterDodge = spendDodgePosture(character, player, now)
+
+	--[[
+		And the one case where the dodge itself breaks the guard.
+
+		`DODGE_POSTURE_LOCKOUT` is 90 precisely so that one dodge from a clean pool
+		cannot rupture: 90 + 25 (the worst ladder cost) is 115, which is over 100, so
+		the ladder and the lockout are the same rule read from two ends. This branch
+		is the player who arrives at 95 instead of at 0 — the lockout is enforced
+		client-side today, so a client that skips it lands here, and the honest answer
+		is that the pool is full and the guard is down.
+
+		Routed through `breakGuard` rather than a bespoke write so a dodge-induced
+		break clears the guard flag, closes the parry window and fires the stun event
+		exactly as a blocked one does. A rupture the player never saw announced would
+		be a state change with no feedback.
+	]]
+	local maximumPosture = character:GetAttribute(MAX_POSTURE_ATTRIBUTE)
+	local guardBrokenByDodge = typeof(maximumPosture) == "number"
+		and postureAfterDodge >= (maximumPosture :: number)
+
+	if guardBrokenByDodge then
+		breakGuard(character)
+	end
+
 	task.delay(DODGE_IFRAME_DURATION, function()
 		--[[
 			The character is parent-checked because the usual reason to still be
@@ -905,10 +1010,13 @@ dodgeEvent.OnServerEvent:Connect(function(player: Player, direction: any)
 	end)
 
 	print(string.format(
-		"[SERVER] %s dodged (%s) - i-frames open for %dms.",
+		"[SERVER] %s dodged (%s) - i-frames open for %dms, posture %d/%d%s.",
 		character.Name,
 		tostring(direction),
-		DODGE_IFRAME_DURATION * 1000
+		DODGE_IFRAME_DURATION * 1000,
+		postureAfterDodge,
+		typeof(maximumPosture) == "number" and (maximumPosture :: number) or MAX_POSTURE,
+		guardBrokenByDodge and " - GUARD BROKEN BY THE DODGE" or ""
 	))
 end)
 
@@ -1326,6 +1434,11 @@ Players.PlayerRemoving:Connect(function(player: Player)
 	-- requests belongs to a player and has to survive that body dying, or a
 	-- respawn would let a spamming player skip the cooldown entirely.
 	lastDodgeRequest[player] = nil
+	-- Day 10 · Part 1/2: the spam ladder is per-player for the same reason, and is
+	-- cleared on the same edge. Carrying `dodgePressChain` across a rejoin would mean
+	-- a player's first dodge back was priced as the fifth in a chain they never threw.
+	lastDodgePress[player] = nil
+	dodgePressChain[player] = nil
 end)
 
 print("[SERVER] HitValidator online: RegisterHitEvent, AttackStateEvent, GuardStateEvent, GuardClashEvent, GuardBreakEvent, ParryResultEvent, ComboBreakEvent, DeflectClashEvent, ChaosTestEvent and DodgeEvent are live.")

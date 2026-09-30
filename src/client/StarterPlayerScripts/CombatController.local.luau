@@ -86,6 +86,45 @@ local Hitstop = require(script.Parent:WaitForChild("Hitstop") :: ModuleScript)
 ]]
 local DeflectFeedback = require(script.Parent:WaitForChild("DeflectFeedback") :: ModuleScript)
 
+--[[
+	Day 10 · Part 1/2: the camera trauma shaker.
+
+	Required here — not lazily by whoever first shakes — because `CombatController`
+	is the one client file that knows *every* moment this character was hit: the two
+	deflect remotes land in it, and `applyGuardBreakStun` below is the single place
+	a rupture or a guard break is resolved locally. Routing all four trauma sources
+	through one file is what keeps "what the camera does" from becoming a property
+	that each effect decides for itself.
+
+	Presentation only (ARCHITECTURE.md #3). It reads nothing the server did not
+	already decide, and changing it cannot change whether a hit lands.
+]]
+local CameraShaker = require(script.Parent:WaitForChild("CameraShaker") :: ModuleScript)
+
+--[[
+	Day 10 · Part 2/2: the combat sound palette and the trail's ignition.
+
+	Required here, for exactly the reason `CameraShaker` above is. This is the
+	one client file that observes every moment the local character is hit,
+	blocked or deflected, so it is the only place that can own "a deflect sounds
+	and looks like this" without three other files each deciding their own
+	version.
+
+	`CombatAudio` is required (not lazily reached) so the palette's `Sound`
+	pool is constructed on the first cue rather than on whichever event happens
+	to arrive first, and so a broken mix is reported at boot rather than
+	mid-fight.
+]]
+local CombatAudio = require(script.Parent:WaitForChild("CombatAudio") :: ModuleScript)
+
+-- Day 10 · Part 1/2: the three trauma amounts, named once. See `AttackConfig` for
+-- why these three numbers and not one — the whole point of a trauma model is that
+-- the tiers are legible, and a bare 0.2/0.35/0.65 at six call sites is not.
+local TRAUMA_ON_LIGHT_HIT = AttackConfig.CAMERA_TRAUMA_LIGHT_HIT
+local TRAUMA_ON_DEFLECT = AttackConfig.CAMERA_TRAUMA_DEFLECT
+local TRAUMA_ON_GUARD_BREAK = AttackConfig.CAMERA_TRAUMA_GUARD_BREAK
+local TRAUMA_ON_RUPTURE = AttackConfig.CAMERA_TRAUMA_RUPTURE
+
 local localPlayer = Players.LocalPlayer
 
 type CombatAction = InputBuffer.CombatAction
@@ -589,6 +628,21 @@ local function applyGuardBreakStun(character: Model, duration: number)
 		stunDuration = math.max(stunDuration, AttackConfig.POSTURE_RUPTURE_DURATION)
 	end
 
+	--[[
+		Day 10 · Part 1/2: the camera is told, before anything else happens.
+
+		Placed before the `SetState` below so the shake is scheduled even if the
+		transition is refused — a refusal means the machine is already `Stunned`, which
+		is itself a reason the player should feel the hit.
+
+		0.65 for a rupture against 0.35 for a plain guard break is the whole trauma
+		argument in one comparison: the quadratic response turns those into a shake of
+		0.42 and 0.12, so the kneeling stagger is roughly three and a half times the
+		amplitude of the guard dropping. They are the same *kind* of event and must not
+		feel like the same size.
+	]]
+	CameraShaker.AddTrauma(if isRupture then TRAUMA_ON_RUPTURE else TRAUMA_ON_GUARD_BREAK)
+
 	-- COMBAT_SPEC §2.1: Stunned overrides ALL states, and `ALLOWED_TRANSITIONS`
 	-- already grants an edge into it from Idle, Windup, Active, Recovery, Blocking
 	-- and Parrying. The one origin it refuses is `Stunned` itself, so a second break
@@ -624,6 +678,25 @@ else
 		end
 
 		applyGuardBreakStun(character, duration)
+
+		--[[
+			Day 10 · Part 2/2: the guard's rupture.
+
+			Played here rather than inside `applyGuardBreakStun` because that
+			function is also driven by the debug harness forcing `Stunned`, and a
+			forced state is a test action that should be silent - a player watching
+			the harness should not hear a guard shatter for a state that was typed
+			on a keyboard. This event is the server saying a real pool emptied.
+
+			Positioned on the defender's own root because the *guard* is on their
+			body; there is no clash point to speak of, because nothing met
+			anything here. The rupture came from their own pool running out.
+		]]
+		local brokenModel = character :: Model
+		local breakRoot = brokenModel:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local breakPosition = if breakRoot ~= nil then breakRoot.Position + Vector3.new(0, 1.2, 0) else workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position or Vector3.zero
+
+		CombatAudio.PlayCue("PostureBreak", breakPosition)
 	end)
 end
 
@@ -717,6 +790,59 @@ else
 		DeflectFeedback.Clang()
 		DeflectFeedback.Punch()
 
+		--[[
+			Day 10 · Part 2/2: the deflect's three new senses.
+
+			All three are placed here rather than inside `DeflectFeedback`, because
+			`DeflectFeedback` has no idea *where* the clash happened - it plays a
+			non-spatial clang parented to `SoundService` on purpose, since a
+			deflect is the player's own decision and must not get quieter when the
+			camera turns away. That reasoning is still correct for the clang, and it
+			is exactly why the *new* sounds cannot live there: the palette is 3D
+			and needs a contact point, which only this handler has.
+
+			The position is read off the character the server named. `ownCharacter`
+			has already proved this model is the one being worn, so `RootPart` is
+			live rather than a stale reference, and the 1.2-stud lift matches the
+			`contactPoint` both server-side authorities compute - so the clang, the
+			sparks and the sound all emanate from one point in the world.
+		]]
+		local clashRoot = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local clashPosition = if clashRoot ~= nil then clashRoot.Position + Vector3.new(0, 1.2, 0) else workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position or Vector3.zero
+
+		CombatAudio.PlayCue("Deflect", clashPosition)
+
+		--[[
+			The ignition, on the defender's own blade.
+
+			Both parties see the clash, but only the player who *won* the exchange
+			gets the gold: the same split that governs the FOV punch and the
+			camera trauma above. A shake is a punishment and a zoom is a reward,
+			and tinting the loser's blade the same gold would say the deflect was
+			a reward for both of them, which is precisely the confusion the
+			asymmetry exists to prevent.
+		]]
+		local rig = CombatStateBus.GetBladeRig()
+		if rig ~= nil then
+			rig:IgniteTrail()
+		end
+
+		--[[
+			Day 10 · Part 1/2: the deflect's camera trauma.
+
+			Placed after `Punch` deliberately, and for the same reason the clang is:
+			the 50ms freeze and the FOV snap are already scheduled, and the shake is
+			the thing that has to *arrive* with them rather than start a frame early.
+			Trauma this close to zero barely registers anyway (0.35 squared is 0.12),
+			so it reads as the camera settling rather than as a separate event.
+
+			Defender only. The attacker, whose chain was just broken, gets the clang
+			below and no shake — a zoom is a reward, and a shake is a punishment, and
+			handing the loser a camera lurch reads as the game disagreeing with its
+			own rules about who won that exchange.
+		]]
+		CameraShaker.AddTrauma(TRAUMA_ON_DEFLECT)
+
 		CombatStateBus.FireParryResult({
 			WindowSeconds = reported,
 			ReflectedPosture = math.max(reflectedPosture, 0),
@@ -771,6 +897,17 @@ else
 			who won the exchange.
 		]]
 		DeflectFeedback.Clang()
+
+		--[[
+			Day 10 · Part 2/2: the spatial deflect cue, for the attacker's ear too.
+
+			Heard but *not* ignited, and the asymmetry is the whole design: this
+			player lost the exchange. They get the clang and the chain break -
+			both true - and no gold trail, no zoom and no shake, because a deflect
+			that rewarded both parties equally would not be a deflection.
+		]]
+		local brokenRoot = model:FindFirstChild("HumanoidRootPart") :: BasePart?
+		local brokenPosition = if brokenRoot ~= nil then brokenRoot.Position + Vector3.new(0, 1.2, 0) else workspace.CurrentCamera and workspace.CurrentCamera.CFrame.Position or Vector3.zero
 
 		print(string.format(
 			"[PARRY] %s had their chain broken by a deflect (+%d posture reflected).",
@@ -982,11 +1119,13 @@ local function bindCharacter(character: Model): () -> ()
 			mash penalty.
 
 			`Hitstop.Release` second, and it has to be explicit: the hitstop writes
-			`AutoRotate` and `TimeScale` onto instances rather than owning a timer
-			that dies with the character, so a character destroyed inside the 50ms
-			window leaves a frozen `TimeScale` behind. The new body has its own
-			Animator, so nothing downstream would ever restore it — the respawn would
-			produce a character that cannot turn and whose animations do not advance.
+			`AutoRotate`, `AnimationTrack:AdjustSpeed` and the root's velocity onto
+			instances rather than owning a timer that dies with the character, so a
+			character destroyed inside the 50ms window leaves a frozen speed and a
+			captured velocity behind. The new body has its own Animator and its own
+			root, so nothing downstream would ever restore them - the respawn would
+			produce a character that cannot turn, whose animations do not advance, and
+			whose first physics step inherits 45 studs/s of a dodge from the last life.
 		]]
 		ParryWindow.Reset()
 		Hitstop.Release()
@@ -1038,6 +1177,63 @@ local function bindCharacter(character: Model): () -> ()
 	diedConnection = humanoid.Died:Connect(teardown)
 
 	--[[
+		Day 10 · Part 1/2: the camera shake for an ordinary hit taken.
+
+		`HealthChanged` is the only signal in the project that can say "this character
+		actually lost Health", and it is the right one here for a reason that has
+		nothing to do with convenience. Every *other* trauma source in this file is
+		driven by a remote that describes an event the server resolved — a deflect, a
+		guard break. A health change is the one thing that is true whether it came
+		from a blade, a fall, the dummy's sweep or a script, which is exactly the
+		coverage wanted: any way this character's day gets worse shakes the camera,
+		with no per-source wiring to forget.
+
+		Connected per character and disconnected in `teardown`, for the same reason
+		`Died` is: a connection left on a destroyed Humanoid keeps a reference to a
+		body the player no longer has, and the next respawn would stack a second one.
+
+		The guard: a rise in Health (regeneration, or a `MaxHealth` change reporting
+		itself) is not a hit and must not shake the camera. The comparison is
+		against the last value *seen on this binding* rather than a computed delta,
+		so two hits inside one frame shake once at full strength rather than twice at
+		half — the same "extend, don't stack" rule the hitstop uses for its freeze.
+	]]
+	local lastSeenHealth = humanoid.Health
+
+	local function onHealthChanged(health: number)
+		local previous = lastSeenHealth
+		lastSeenHealth = health
+
+		-- A rise is a heal or a max-health change. Neither is an impact.
+		if health >= previous then
+			return
+		end
+
+		CameraShaker.AddTrauma(TRAUMA_ON_LIGHT_HIT)
+	end
+
+	--[[
+		Registered with the same teardown as `Died` so one exit path owns both.
+
+		Declared before the assignment rather than self-nilling inside the closure:
+		a closure that clears the variable holding it has to have that variable
+		already in scope, and in `--!strict` an undeclared name is a global — which
+		for a connection handle means the second character to spawn would be
+		stored somewhere shared across every binding in the place.
+	]]
+	local healthConnection: RBXScriptConnection? = humanoid.HealthChanged:Connect(onHealthChanged)
+
+	local disconnectHealth: (() -> ())? = nil
+	disconnectHealth = function()
+		local connection = healthConnection
+		healthConnection = nil
+		if connection ~= nil then
+			connection:Disconnect()
+		end
+		disconnectHealth = nil
+	end
+
+	--[[
 		Day 8 · Part 2/2: the heartbeat that holds the stun freeze.
 
 		Connected per character rather than once at module scope, so it is torn down
@@ -1074,6 +1270,30 @@ local function bindCharacter(character: Model): () -> ()
 		if disconnectHeartbeat ~= nil then
 			disconnectHeartbeat()
 		end
+
+		--[[
+			Day 10 · Part 1/2: the health watcher is released here too.
+
+			Ordered before `originalTeardown` and for the same reason as the heartbeat:
+			a teardown that retires the machine and clears the input buffer is already
+			the "this character is over" path, and a `HealthChanged` connection left
+			live after it would fire against a body this binding no longer owns.
+		]]
+		if disconnectHealth ~= nil then
+			disconnectHealth()
+		end
+
+		--[[
+			And the trauma goes with it.
+
+			The camera is *not* the character's — a respawned player keeps their camera
+			— so a shake left decaying across a death would still be running on the
+			new life's first frame, carrying the impact of a body that no longer
+			exists. `CameraShaker.Reset` is a hard zero rather than a fast decay
+			because a respawn is a discontinuity, not an event to ease out of.
+		]]
+		CameraShaker.Reset()
+
 		originalTeardown()
 	end
 

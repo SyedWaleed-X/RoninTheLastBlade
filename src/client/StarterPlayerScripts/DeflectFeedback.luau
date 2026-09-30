@@ -41,33 +41,44 @@
 	*tight* ring, not a heavy thud, and the same recording at 1.2x reads as a
 	lighter, higher clash without needing a second asset.
 
-	Why the FOV punch has to be idempotent
-	--------------------------------------
-	The naive version of this is `camera.FieldOfView -= 2` and a tween back to the
-	saved value, and it is wrong the moment two deflects land inside 50ms: the second
-	call saves the *already punched* FOV as its new base and the camera never returns
-	to where it started, drifting a little further in with every parry until the
-	player is looking down a telescope. So the base is captured once per punch
-	*sequence* and reused, exactly as `Hitstop` keeps a deadline rather than
-	restarting a timer: a second deflect inside a live punch re-punches from the
-	original base and re-aims the same return.
+	Where the FOV punch went on Day 10
+	----------------------------------
+	This module used to own the punch outright. It does not any more: `Hitstop` is
+	the single writer of `Camera.FieldOfView`, and `Punch` below is a delegation.
 
-	The `punchCamera` check is the other half of that. `workspace.CurrentCamera` can
-	be swapped at any time (a character respawn, a cutscene), and writing a stale
-	base onto a camera that replaced the one that was punched would be a jump in
-	field of view for no reason the player can see. The restore only happens if the
-	camera it was punched on is still the current one.
+	The reason is the argument that used to live here, which is still true and is now
+	the reason for the move rather than an implementation detail. The naive version
+	of this effect is `camera.FieldOfView -= 2` and a tween back to the saved value,
+	and it is wrong the moment two deflects land inside 50ms: the second call saves
+	the *already punched* FOV as its new base and the camera never returns to where it
+	started, drifting further in with every parry until the player is looking down a
+	telescope. Solving that once per module is not a solution — it is the same rule
+	restated, waiting for one module to forget it. A camera property with one owner
+	cannot drift at all, so the camera moved.
+
+	`Clang` stayed here because a `Sound` is not a camera: nothing else in the
+	project plays a clash, and there is no second writer to protect against.
 
 	Rules honoured here:
 	  * ARCHITECTURE.md #1 - this file is `--!strict`.
 	  * ARCHITECTURE.md #3 - presentation only. Nothing here reads or writes combat
 	    state; it draws and sounds what the server already decided.
 	  * ARCHITECTURE.md #4 - no per-frame path. `Clang` and `Punch` run on a remote
-	    event, and the punch allocates exactly one tween per deflect.
+	    event; the punch itself is a delegated call into `Hitstop`'s existing render
+	    step and allocates nothing here.
 ]]
 
 local SoundService = game:GetService("SoundService")
-local TweenService = game:GetService("TweenService")
+
+--[[
+	Day 10 · Part 1/2: required for its `PunchFOV` side effect.
+
+	Same reasoning as every other require in `PlayerScripts` — a ModuleScript does
+	not run until something requires it, and `CombatController` requires both modules
+	so they observe the same instance. The dependency is one-way (`DeflectFeedback`
+	reads `Hitstop`, `Hitstop` knows nothing of the deflect), so it cannot cycle.
+]]
+local Hitstop = require(script.Parent:WaitForChild("Hitstop") :: ModuleScript)
 
 --[[
 	The clash asset and its mix.
@@ -84,19 +95,20 @@ local CLANG_VOLUME = 0.65
 local CLANG_PLAYBACK_SPEED = 1.2
 
 --[[
-	The punch.
+	The punch's tuning, retired to Day 10 · Part 1/2.
 
-	Two degrees is small on purpose - it is meant to be felt more than seen, and a
-	larger value would read as the camera being yanked. 50ms is three frames at
-	60Hz: long enough to register as a hit, short enough that nobody could accuse
-	the camera of moving.
+	Two degrees over 50ms were the original values. Both now live in `AttackConfig`
+	as `FOV_PUNCH_DEGREES` (3) and `FOV_PUNCH_RETURN_DURATION` (0.15) and are read
+	by `Hitstop`, so the camera's numbers are set in exactly one place.
+
+	Three degrees rather than two because the punch now shares its recovery with a
+	render step that also has to survive a camera swap mid-punch, and a slightly
+	larger instant is what stays legible against a shake that is simultaneously
+	ramping down. 150ms rather than 50ms because it now outlasts the 50ms hitstop
+	on purpose — the snap has to be inside the freeze or it is missed entirely, and
+	the ease back has to outlast it or the punch reads as cut off rather than
+	recovered from.
 ]]
-local FOV_PUNCH_DEGREES = 2
-local FOV_PUNCH_DURATION = 0.05
-
--- The camera's field of view is clamped at 1 by the engine; a punch applied to a
--- camera already sitting at the floor must not write below it.
-local MIN_FOV = 1
 
 --[[
 	The module's own table.
@@ -114,12 +126,6 @@ local DeflectFeedback = {}
 -- should not pay for a Sound instance either.
 local clangSound: Sound? = nil
 
--- The camera currently being punched, the FOV to put back, and the live return
--- tween. All three exist to make a second punch inside a live one continue the
--- same sequence rather than stack a new one.
-local punchCamera: Camera? = nil
-local punchRestoreFov = 0
-local punchTween: Tween? = nil
 
 --[[
 	Creates the clash sound once, on first use.
@@ -167,73 +173,21 @@ function DeflectFeedback.Clang()
 end
 
 --[[
-	The camera punch: in instantly, back out over `FOV_PUNCH_DURATION`.
+	The camera punch: in instantly, back out over the shared recovery.
 
-	Instant in, eased out - not the other way round. A punch that eases *in* is a
-	zoom, and a hit that zooms is a hit the player has time to think about. Snapping
-	and recovering is what a physical impact does to a lens, and it is the half of
-	this effect that reads as force rather than as a camera move.
+	Day 10 · Part 1/2: this is now a one-line delegation to `Hitstop.PunchFOV`, which
+	owns `Camera.FieldOfView` outright. The whole idempotency argument this function's
+	header used to make - capture the base once per sequence so a second deflect
+	inside a live punch cannot re-base off the already-punched value - is now
+	enforced in one place rather than being re-derived per module.
+
+	The method is kept rather than deleted so the call site in `CombatController` still
+	reads "a deflect happened, do its feedback", and so the split stays legible:
+	`DeflectFeedback` is the deflect's *feedback list*, `Hitstop` owns the camera and
+	the freeze. The sound is still played here because nothing else touches it.
 ]]
 function DeflectFeedback.Punch()
-	local camera = workspace.CurrentCamera
-	if camera == nil then
-		return
-	end
-
-	--[[
-		Capture the base once per sequence.
-
-		If this camera is already mid-punch then the FOV to return to is the one the
-		*previous* punch recorded, not the punched value currently on the camera -
-		the drift bug described in the header. A punch on a different camera (a
-		respawn swapped it) re-bases off whatever that camera is showing.
-	]]
-	local base: number
-	if punchCamera == camera then
-		base = punchRestoreFov
-
-		local live = punchTween
-		punchTween = nil
-		if live ~= nil then
-			live:Cancel()
-		end
-	else
-		base = camera.FieldOfView
-	end
-
-	punchCamera = camera
-	punchRestoreFov = base
-
-	local punched = base - FOV_PUNCH_DEGREES
-	if punched < MIN_FOV then
-		punched = MIN_FOV
-	end
-
-	camera.FieldOfView = punched
-
-	local returnTween = TweenService:Create(camera, TweenInfo.new(
-		FOV_PUNCH_DURATION,
-		Enum.EasingStyle.Quad,
-		Enum.EasingDirection.Out
-	), { FieldOfView = base })
-
-	punchTween = returnTween
-
-	returnTween.Completed:Once(function()
-		-- Only the current tween may clear the sequence: a newer punch owns it now
-		-- and this callback is stale.
-		if punchTween ~= returnTween then
-			return
-		end
-
-		punchTween = nil
-
-		if punchCamera == camera then
-			punchCamera = nil
-		end
-	end)
-
-	returnTween:Play()
+	Hitstop.PunchFOV()
 end
 
 return DeflectFeedback

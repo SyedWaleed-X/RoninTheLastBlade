@@ -85,6 +85,16 @@ local CombatTypes = require(ReplicatedStorage:WaitForChild("CombatTypes") :: Mod
 local AttackConfig = require(ReplicatedStorage:WaitForChild("AttackConfig") :: ModuleScript)
 local CombatStateBus = require(script.Parent:WaitForChild("CombatStateBus") :: ModuleScript)
 
+--[[
+	Day 10 · Part 1/2: required so the dodge's lean tween can be paused by a hitstop.
+
+	Same reasoning as every other require in `PlayerScripts` — a ModuleScript does
+	not run until something requires it, and `CombatController` requires both so they
+	observe the same instance. The dependency is one-way (`DodgeController` registers
+	with `Hitstop`; `Hitstop` knows nothing about the dodge), so it cannot cycle.
+]]
+local Hitstop = require(script.Parent:WaitForChild("Hitstop") :: ModuleScript)
+
 type CombatState = CombatTypes.CombatState
 
 local DODGE_IFRAME_DURATION = AttackConfig.DODGE_IFRAME_DURATION
@@ -101,6 +111,7 @@ local DODGE_LEAN_TORSO_DROP = AttackConfig.DODGE_LEAN_TORSO_DROP
 local DODGE_LEAN_TWEEN_IN = AttackConfig.DODGE_LEAN_TWEEN_IN
 local DODGE_LEAN_RETURN_DURATION = AttackConfig.DODGE_LEAN_RETURN_DURATION
 local POSTURE_ATTRIBUTE = AttackConfig.POSTURE_ATTRIBUTE
+local MAX_POSTURE_ATTRIBUTE = AttackConfig.MAX_POSTURE_ATTRIBUTE
 local DODGE_POSTURE_LOCKOUT = AttackConfig.DODGE_POSTURE_LOCKOUT
 local DODGE_POSTURE_COST = AttackConfig.DODGE_POSTURE_COST
 local DODGE_SPAM_WINDOW = AttackConfig.DODGE_SPAM_WINDOW
@@ -494,6 +505,27 @@ local function applyDodgeLean(rootPart: BasePart, direction: Vector3)
 		{ C0 = neutral * CFrame.Angles(pitch, 0, bank) * CFrame.new(0, -drop, 0) }
 	)
 	leanTween = tween
+
+	--[[
+		Day 10 · Part 1/2: registered with the hitstop so a deflect pauses it.
+
+		A lean caught mid-ease when the blades meet is the clearest case of the
+		hitstop not being a hitstop: the torso is frozen at 25 degrees by the
+		`AdjustSpeed(0)` on the Animator, but this tween keeps easing it to neutral
+		anyway, so the pose unwinds smoothly while everything else is stopped. That
+		reads as a glitch rather than as impact.
+
+		There is no `TweenService:PauseAll` in this engine (verified against the live
+		class), so "pause whatever is running" is not available and the tweens worth
+		freezing have to identify themselves. `Hitstop.RegisterTween` is that
+		identifier, and the unregister below is what keeps the registry from growing
+		for the life of the session.
+	]]
+	Hitstop.RegisterTween(tween)
+	tween.Completed:Once(function()
+		Hitstop.UnregisterTween(tween)
+	end)
+
 	tween:Play()
 end
 
@@ -524,19 +556,26 @@ end
 	player who spaces their evasions a beat apart is visibly charged the flat rate
 	instead. A flat increment rather than a multiplier is what keeps that legible.
 
-	Authoritative-ness, stated honestly
-	------------------------------------
-	ARCHITECTURE.md #3 keeps the server authoritative for damage and state
-	transitions; this is a *cost the client charges itself*, written onto its own
-	copy of the `RoninPosture` attribute. Because that attribute replicated down
-	from the server, a client write changes only the local copy and never travels
-	up - so this cannot be used to gain anything, and a cheater who edits the value
-	locally simply dodges for free against their own HUD, which is a cosmetic cheat
-	and not a combat one. What the local write *does* buy is honesty for everyone
-	playing normally: the gauge drops the instant the dodge is thrown rather than
-	one network hop later, so the cost is legible at the moment it is paid. That is
-	why this is a prediction written to the client's own copy rather than a server
-	round-trip.
+	Authoritative-ness, and what changed on Day 10
+	-----------------------------------------------
+	Day 9 shipped this as a purely client-side prediction, and Day 9 · Part 2/2 stated
+	the gap plainly: the write went onto the client's own copy of `RoninPosture`,
+	which replicates *down*, so it could never travel up. The cost was real to
+	someone playing normally and free to anyone who cared to edit it.
+
+	Day 10 · Part 1/2 closes it. `HitValidator`'s `DodgeEvent` handler now deducts the
+	same `AttackConfig` numbers on the server, through the same `spendPosture` helper
+	every block and deflect uses, and stamps `RoninLastPostureHitTime` so the 1.2s
+	poise grace starts on the dodge. This function is now *prediction only*: it runs a
+	frame or two earlier so the gauge moves on the press rather than a network hop
+	later, and the server's value overwrites it on arrival.
+
+	The local ladder here and the server's there are kept in step by sharing
+	`DODGE_SPAM_WINDOW` / `DODGE_SPAM_COST_STEP` / `DODGE_SPAM_MAX_CHAIN` from
+	`AttackConfig` rather than each deriving them. If they ever disagree the gauge
+	would show the client one price and the server charge another, which is the silent
+	drift this project's config file exists to prevent - so both sides read the same
+	literal and the server re-derives its own count rather than trusting this one.
 ]]
 local lastDodgePostureAt: number? = nil
 local dodgePostureChain = 0
@@ -567,6 +606,23 @@ end
 	no character, no room to stand - never advances the chain counter. That
 	ordering is the difference between "I dodged three times quickly" and "I
 	pressed Q three times while stunned", and only the first should be punished.
+
+	Day 10 · Part 1/2: the charge goes UP, not down.
+
+	This used to read `math.max(0, current - cost)`, which was a sign error that
+	only survived because the write was local (invariant 8) and nothing compared
+	it against the rules. `RoninPosture` is a *damage* pool: it climbs toward
+	`MAX_POSTURE_ATTRIBUTE` (100) and the character ruptures when it arrives, and
+	`isDodgePostureLocked` refuses a dodge at 90 or above for exactly that reason.
+	Subtracting the cost therefore made the cheapest move in the game the only one
+	that *healed* the guard — the precise opposite of the Day 9 premise that the
+	dodge is not free, and it made the lockout unreachable by dodging.
+
+	The cost is now the server's (Day 10 · Part 1/2), and this write is prediction
+	only: it runs a frame or two earlier so the gauge moves on the dodge rather than
+	after it, and the authoritative value overwrites it on arrival. The clamp is at
+	`maximum` rather than 0 for the same reason the server's is — the number the
+	player sees has to be a number the rules can compare against.
 ]]
 local function spendDodgePosture(character: Model, now: number): number
 	if lastDodgePostureAt ~= nil and (now - lastDodgePostureAt) < DODGE_SPAM_WINDOW then
@@ -579,11 +635,13 @@ local function spendDodgePosture(character: Model, now: number): number
 	local cost = DODGE_POSTURE_COST + dodgePostureChain * DODGE_SPAM_COST_STEP
 
 	local current = character:GetAttribute(POSTURE_ATTRIBUTE)
-	if typeof(current) == "number" then
-		-- Clamped at zero so a chain of dodges taken against an already-spent pool
-		-- cannot drive the local reading negative, which the gauge would render as
-		-- a bar wider than its track.
-		character:SetAttribute(POSTURE_ATTRIBUTE, math.max(0, current - cost))
+	local maximum = character:GetAttribute(MAX_POSTURE_ATTRIBUTE)
+	if typeof(current) == "number" and typeof(maximum) == "number" then
+		local nextPosture = current + cost
+		if nextPosture > maximum then
+			nextPosture = maximum
+		end
+		character:SetAttribute(POSTURE_ATTRIBUTE, nextPosture)
 	end
 
 	return cost

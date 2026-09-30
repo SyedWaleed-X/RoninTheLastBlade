@@ -102,6 +102,20 @@ export type BladeRig = {
 	Tip: Attachment,
 	Trail: Trail,
 	SetTrailEnabled: (enabled: boolean) -> (),
+	--[[
+		Day 10 · Part 2/2: the deflect's ignition.
+
+		Published on the same seam as `SetTrailEnabled` rather than as a separate
+		subscription, for the same reason the trail's enable flag is not: the
+		ignition is a property of *this* blade's trail, and a consumer that had
+		to find the `Trail` by name would depend on the rig's internal naming -
+		which is exactly the coupling the `BladeRig` type exists to prevent.
+
+		Callers are `CombatController`, on the deflect paths. The method owns the
+		duration and the return-to-steel entirely, so a caller that only knows
+		"a parry happened" cannot get the recovery wrong.
+	]]
+	IgniteTrail: () -> (),
 	StartSwing: (
 		hitIndex: number,
 		windupDuration: number,

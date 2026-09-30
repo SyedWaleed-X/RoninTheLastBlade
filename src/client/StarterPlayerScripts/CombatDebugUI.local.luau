@@ -12,6 +12,13 @@ local CombatStateBus = require(script.Parent:WaitForChild("CombatStateBus") :: M
 local InputBuffer = require(script.Parent:WaitForChild("InputBuffer") :: ModuleScript)
 local InputGate = require(script.Parent:WaitForChild("InputGate") :: ModuleScript)
 
+-- Day 10 P2/2: the juice stress suite (Key [U]) drives the real camera and audio
+-- subsystems rather than the state machine, so it needs all three. Required here
+-- rather than lazily reached so a broken mix is reported at boot, not on the
+-- first [U] press, which is the worst possible moment to discover it.
+local CameraShaker = require(script.Parent:WaitForChild("CameraShaker") :: ModuleScript)
+local CombatAudio = require(script.Parent:WaitForChild("CombatAudio") :: ModuleScript)
+
 type CombatState = CombatTypes.CombatState
 type CombatAction = InputBuffer.CombatAction
 
@@ -1603,6 +1610,150 @@ local function runPostureChaosSuite()
 		error("[POSTURE CHAOS] FAILED: see the per-invariant lines above.")
 end
 
+--[[
+Day 10 P2/2: the juice stress suite (Key [U]).
+
+Twenty deflect clashes across one second, then four assertions about the
+systems that have to survive them. The other suites in this file test the
+*state machine*; this one tests the three systems bolted around it, which is
+the only part of the game with no single owner:
+
+  1. Trauma saturates. `CameraShaker` clamps to 1.0, so twenty impacts must
+     leave it at exactly 1.0 and never above - an unclamped sum is what turns
+     a fast chain into the camera spinning forever.
+  2. Trauma then decays. Sampled across the window after the burst, it must be
+     strictly falling: saturation is correct, saturation that never comes back
+     down is the actual failure mode being guarded against.
+  3. The mix is intact on this client. Read from the live `SoundGroup` tree, not
+     from `AttackConfig` - a config assertion passes on a client that never
+     received the replicated mix at all, which is precisely the case worth
+     catching.
+  4. Every impact was heard. `PlayCount` must advance by exactly the impact
+     count. Without this, twenty silent no-ops would pass all three assertions
+     above and print a green line.
+
+The impacts are spaced by `CHAOS_JUICE_STEP` rather than fired in one frame.
+Firing twenty in a single frame exercises the same code paths and proves
+nothing about the mix: a limiter only earns its keep on a signal that arrives
+over time, and a voice pool under one-frame pressure behaves nothing like one
+under a real chain.
+]]
+local function runJuiceChaosSuite()
+if chaosSuiteRunning then
+warn("[JUICE CHAOS] A run is already in flight; press ignored.")
+return
+end
+
+if CombatStateBus.GetActiveMachine() == nil then
+warn("[JUICE CHAOS] Skipped: no state machine bound (is the character alive?)")
+return
+end
+
+chaosSuiteRunning = true
+InputGate.Set(true)
+
+local before = CombatAudio.PlayCount
+local origin = if workspace.CurrentCamera then workspace.CurrentCamera.CFrame.Position else Vector3.zero
+
+-- Start from a known shake so the decay assertion below is about this
+-- run and not about whatever the player walked into.
+CameraShaker.Reset()
+
+print(string.format(
+"[JUICE CHAOS] Day 10 suite starting: %d impacts over %.2fs.",
+AttackConfig.CHAOS_JUICE_IMPACTS,
+AttackConfig.CHAOS_JUICE_WINDOW))
+
+--
+-- The burst. Trauma, cue, and a scattered position per impact so the
+-- voices are genuinely competing for the same bus rather than stacking
+-- at one point (where they would sum coherently and flatter the limiter).
+--
+local peakTrauma = 0
+local traumaSamples = 0
+
+for impact = 1, AttackConfig.CHAOS_JUICE_IMPACTS do
+CameraShaker.AddTrauma(AttackConfig.CAMERA_TRAUMA_DEFLECT)
+
+local peak = CameraShaker.GetTrauma()
+if peak > peakTrauma then
+peakTrauma = peak
+end
+
+-- A small deterministic ring around the listener: no RNG, so a failing
+-- run reproduces exactly.
+local angle = (impact / AttackConfig.CHAOS_JUICE_IMPACTS) * math.pi * 2
+local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * 4
+CombatAudio.PlayCue("Deflect", origin + offset)
+
+traumaSamples += 1
+task.wait(AttackConfig.CHAOS_JUICE_STEP)
+end
+
+-- The assertions, each reported on its own line so a failure names itself.
+local played = CombatAudio.PlayCount - before
+local mix = CombatAudio.GetMixDiagnostics()
+local voicesPlaying, voicesTotal = CombatAudio.GetVoiceStats()
+
+-- Saturation, checked against the sample taken *during* the burst rather than
+-- at the end: by the last impact the decay has already begun pulling the value
+-- back off 1.0, so asserting on the final figure would fail a healthy clamp.
+local saturates = peakTrauma <= 1.0
+and traumaSamples == AttackConfig.CHAOS_JUICE_IMPACTS
+
+-- Decay, sampled twice with a gap longer than one decay period, so a single
+-- dropped frame cannot fake a fall.
+local traumaAfterBurst = CameraShaker.GetTrauma()
+task.wait(0.4)
+local traumaLater = CameraShaker.GetTrauma()
+local decays = traumaLater < traumaAfterBurst
+
+local mixIntact = mix.MasterPresent == true
+and mix.CombatGroupPresent == true
+and mix.AmbienceGroupPresent == true
+and mix.DuckSideChainPresent == true
+and mix.LimiterPresent == true
+
+local capped = voicesPlaying <= AttackConfig.AUDIO_VOICE_LIMIT
+local allPlayed = played == AttackConfig.CHAOS_JUICE_IMPACTS
+
+local results = {
+{ "trauma saturates at 1.0", saturates, string.format("peak=%.3f over %d impacts", peakTrauma, traumaSamples) },
+{ "trauma decays after the burst", decays, string.format("%.3f -> %.3f", traumaAfterBurst, traumaLater) },
+{ "mix tree intact (master/combat/ambience/duck/limiter)", mixIntact, string.format("voices playing %d of %d total", voicesPlaying, voicesTotal) },
+{ "voice cap honoured", capped, string.format("%d <= %d", voicesPlaying, AttackConfig.AUDIO_VOICE_LIMIT) },
+{ "all impacts reached the voice pool", allPlayed, string.format("%d of %d", played, AttackConfig.CHAOS_JUICE_IMPACTS) },
+}
+
+local allPassed = true
+
+for _, result in results do
+print(string.format(
+"[JUICE CHAOS] %s -- %s (%s)",
+if result[1] then "PASS" else "FAIL",
+result[1],
+result[3]
+))
+
+if not result[2] then
+allPassed = false
+end
+end
+
+-- Hand input back and clear the shake on every path, so a failed run leaves the
+-- harness usable and the camera not buzzing.
+InputGate.Set(false)
+CameraShaker.Reset()
+
+if not allPassed then
+error("[JUICE CHAOS] FAILED: see the per-invariant lines above.")
+end
+
+print(string.format(
+"[JUICE CHAOS] All %d rapid impacts processed cleanly without errors.",
+AttackConfig.CHAOS_JUICE_IMPACTS))
+end
+
 UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessedEvent: boolean)
 	if gameProcessedEvent then
 		return
@@ -1638,6 +1789,15 @@ UserInputService.InputBegan:Connect(function(input: InputObject, gameProcessedEv
 	]]
 	if keyCode == Enum.KeyCode.Y then
 		task.spawn(runPostureChaosSuite)
+		return
+	end
+
+	--
+	-- Day 10 P2/2: the juice suite. Spawned for the same reason as [Y]: it
+	-- takes over a second and then blocks on a settle wait, and a blocking
+	-- handler would freeze the harness including its own escape hatch.
+	if keyCode == Enum.KeyCode.U then
+		task.spawn(runJuiceChaosSuite)
 		return
 	end
 

@@ -120,6 +120,21 @@ local MAX_POSTURE = AttackConfig.MAX_POSTURE
 local GUARD_BREAK_STUN_DURATION = AttackConfig.GUARD_BREAK_STUN_DURATION
 
 --[[
+	Day 10 · Part 2/2: the dodge's i-frame flag, read from the same shared source
+	`HitValidator` writes it to.
+
+	Read as a constant here for exactly the reason the other four are: the
+	attribute *name* is the contract. This file deliberately re-implements the
+	defender-side rules rather than requiring the validator (see the header), and
+	the only thing that duplication is allowed to share is a number or a string.
+	A dodge that read a hardcoded "RoninInvulnerable" while the validator read
+	`AttackConfig` would break silently the day the name changed - and it would
+	break in the worst possible direction, since a mismatched i-frame check is a
+	cheat, not a crash.
+]]
+local INVULNERABLE_ATTRIBUTE = AttackConfig.INVULNERABLE_ATTRIBUTE
+
+--[[
 	Dummy tuning.
 
 	None of these are shared contract values - they are the cadence and the manners
@@ -938,6 +953,57 @@ local function resolveStrike(rigHandle: DummyRig, target: Model, token: number, 
 	-- uses for its bursts so the two spark sources cannot read as coming from
 	-- different parts of the world.
 	local contactPoint = (dummyRoot.Position + targetRoot.Position) * 0.5 + Vector3.new(0, 1.2, 0)
+
+	--[[
+		Day 10 · Part 2/2: the dodge, resolved.
+
+		This is the bug this check fixes, and it is worth stating plainly because
+		the symptom ("I dodged perfectly and still took damage") pointed at the
+		dodge rather than at its absence here. `HitValidator` has honoured
+		`RoninInvulnerable` since Day 9, so a *player's* katana already slides
+		straight through an i-framed defender - but the dummy is a second,
+		independent authority that resolves its own strikes, and it never read
+		the attribute. The rule existed; this file just never asked. Two
+		authorities resolving the same rule is exactly the duplication the
+		SparringDummy header warns about, and this is the one place it cost a
+		real mechanic.
+
+		Placement is the whole design decision, and it is deliberately the same
+		one `HitValidator` makes:
+
+		  * **After the swing is proven real.** A cancelled swing is not an
+		    evaded swing; the player was never touched, so claiming they evaded it
+		    would be a lie printed into the console.
+		  * **After range and line-of-sight.** Those two checks are what the
+		    0.7s telegraph buys the player - backing out of the ten studs or
+		    stepping behind cover genuinely misses the strike, and that is a
+		    *miss*, a different event from an *evasion*. Both return cleanly;
+		    they just tell the truth differently.
+		  * **Before the guard, and before the parry.** Invulnerability is a
+		    stronger claim than a block: a block still takes posture damage and
+		    can still be broken, whereas i-frames take nothing at all.
+		    Consulting the guard first would let a defender whose button is
+		    still down from before the dodge absorb posture inside a window in
+		    which they should be untouchable - and the trace would read
+		    "Blocked" on a move the player experienced as untouchable. A player
+		    who sees "Blocked" believes they were hit; a player who sees
+		    "EVADED" knows they were not.
+
+		Zero Health, zero posture, and the `return` is the guarantee - the same
+		shape as the block path's "no `TakeDamage` on this path, ever".
+
+		The attribute read is a plain `== true` rather than a truthiness test for
+		the same reason `readParryWindow` is explicitly typed: `GetAttribute`
+		returns `any`, and a stripping script that left a string here must
+		produce "vulnerable", not a type error inside the hit path.
+	]]
+	if target:GetAttribute(INVULNERABLE_ATTRIBUTE) == true then
+		print(string.format(
+			"[DUMMY EVADED] %s i-framed through the dummy's katana strike!",
+			target.Name
+		))
+		return
+	end
 
 	local isBlocked, dotProduct = resolveGuard(target, targetRoot, dummyRoot)
 

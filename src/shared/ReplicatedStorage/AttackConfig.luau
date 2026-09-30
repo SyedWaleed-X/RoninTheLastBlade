@@ -35,6 +35,29 @@ export type AttackData = {
 }
 
 --[[
+	One entry in the combat sound palette.
+
+	Declared as a type rather than left as the shape of a frozen literal so
+	`CombatAudio` can annotate its pool entries and `--!strict` will prove the
+	palette really does carry these three fields, instead of the playback code
+	trusting a shape it inferred once.
+]]
+export type CombatSoundCue = {
+	Id: string,
+	Volume: number,
+	PlaybackSpeed: number,
+}
+
+--[[
+	The cue *names*, as a closed union.
+
+	Same reasoning as `CombatTypes.CombatState`: the union makes a typo a
+	compile error rather than a silent no-op at runtime, and it is what lets
+	`CombatAudio.PlayCue` prove every branch of its palette lookup is handled.
+]]
+export type CombatCue = "Deflect" | "Block" | "Slash" | "PostureBreak"
+
+--[[
 	The literal is built into an annotated local first and frozen second on purpose:
 	`table.freeze` returns a readonly sealed table, and a readonly literal cannot
 	satisfy a mutable indexer annotation in strict mode. Assigning the plain literal to
@@ -633,6 +656,64 @@ local DODGE_SPAM_COST_STEP = 5
 local DODGE_SPAM_MAX_CHAIN = 3
 local DODGE_POSTURE_LOCKOUT = 90
 
+--[[
+	Day 10 · Part 1/2: the camera trauma economy.
+
+	`Trauma` is a single scalar in [0,1] that decays; the shake the player actually
+	sees is `trauma * trauma`. That squaring is the whole reason the model is worth
+	its three lines: a linear shake spends most of its life at a magnitude the eye
+	reads as "the camera is broken", so a light hit and a guard break feel like the
+	same event at different volumes. Quadratic separates them — a light hit (0.20,
+	shake 0.04) is almost subliminal and a rupture (0.65, shake 0.42) is violent.
+
+	`CAMERA_TRAUMA_DECAY_RATE` (1.4/sec) is what makes a big hit *last*: 0.65 of
+	trauma is roughly 460ms of visible shake, which is about the length of a single
+	deflect's hitstop plus its recovery. Faster and the punch is a single-frame
+	stutter; slower and a fight never settles down.
+
+	The frequencies are deliberately high and *different* per axis. Rotation and
+	translation must never share a rate, or the whole rig oscillates as one rigid
+	body and the shake reads as a swinging camera rather than as impact travelling
+	through it.
+]]
+local CAMERA_TRAUMA_DECAY_RATE = 1.4
+local CAMERA_TRAUMA_LIGHT_HIT = 0.20
+local CAMERA_TRAUMA_DEFLECT = 0.35
+local CAMERA_TRAUMA_GUARD_BREAK = 0.35
+local CAMERA_TRAUMA_RUPTURE = 0.65
+local CAMERA_SHAKE_ROTATION_DEGREES = 1.6
+local CAMERA_SHAKE_TRANSLATION_STUDS = 0.35
+local CAMERA_SHAKE_ROTATION_FREQUENCY = 24
+local CAMERA_SHAKE_TRANSLATION_FREQUENCY = 19
+
+--[[
+	The FOV punch and its default resting value.
+
+	Three degrees is felt rather than seen, which is the intent: a punch large
+	enough to notice as a *camera move* stops reading as impact and starts reading
+	as a zoom the game is performing at you.
+
+	`FOV_PUNCH_RETURN_DURATION` (0.15s) is roughly three times the 50ms hitstop, on
+	purpose. The snap in has to be inside the freeze or it is missed entirely (the
+	screen is not moving anyway); the ease back has to outlast it or the camera
+	settles while the hit is still resolving, which reads as the punch being cut off
+	rather than recovered from.
+]]
+local FOV_PUNCH_DEGREES = 3
+local FOV_PUNCH_RETURN_DURATION = 0.15
+local DEFAULT_FIELD_OF_VIEW = 70
+local MIN_FIELD_OF_VIEW = 1
+
+--[[
+	The hitstop's own default, in seconds.
+
+	Three frames at 60Hz. Long enough that the world visibly stops, short enough
+	that a chain of deflects does not read as lag — which is the failure mode when
+	this is too generous, and the reason `Hitstop.Apply` extends an existing freeze
+	rather than stacking a second one.
+]]
+local HITSTOP_DEFAULT_DURATION = 0.05
+
 
 local MAX_HIT_DISTANCE = 14
 
@@ -645,6 +726,215 @@ local MAX_HIT_DISTANCE = 14
 	generous in the other direction is a window an exploiter can sit in.
 ]]
 local ACTIVE_WINDOW_GRACE = 0.1
+
+--[[
+	Day 10 · Part 2/2 — the SoundService mix tree.
+
+	Three groups, and the nesting is the whole point. `AudioEngine` builds
+	`RoninMaster` as the root and parents the two leaves under it, so the tree
+	reads as one mix rather than two unrelated buckets. Roblox resolves the
+	group graph at the client, so authoring it once on the server gives every
+	player an identical mix with no per-client construction.
+
+	`RoninAmbience` sits at 0.7 rather than 1.0 because ambience is the bed the
+	combat sounds cut *across*. A bed at full volume is not heard as
+	"background", it is heard as the foreground that a deflect has to shout
+	over, and the ducking below then has almost nothing left to duck.
+]]
+local AUDIO_GROUP_MASTER = "RoninMaster"
+local AUDIO_GROUP_COMBAT_SFX = "RoninCombatSFX"
+local AUDIO_GROUP_AMBIENCE = "RoninAmbience"
+
+local AUDIO_MASTER_VOLUME = 1.0
+local AUDIO_COMBAT_SFX_VOLUME = 1.0
+local AUDIO_AMBIENCE_VOLUME = 0.7
+
+--[[
+	Sidechain ducking: the ambience group is compressed *by* the combat group.
+
+	This is what makes a clash feel like it happened in the world rather than
+	only in the player's ears. Without it, wind and birdsong sit at a constant
+	-18dB under a deflect that peaks far above them, so the player reads the
+	clash as "the sound got louder" instead of "everything else got quieter".
+
+	The four numbers are a ducking curve, read left to right:
+
+	  * Threshold -24dB - only combat loud enough to cross this line engages the
+	    duck at all. A quiet footstep in the ambience bed never touches it.
+	  * Ratio 4 - the ambience is pulled down to a quarter of its excess over the
+	    threshold. Higher is a harder pump; 4 is firm enough to read on a single
+	    clash and soft enough that a long exchange does not sound pumpy.
+	  * Attack 0.01s - under one frame at 60Hz, so the duck is already down by
+	    the time the clang is. A slower attack lets the first ~30ms of the
+	    impact land at full ambience, which is exactly the thinness that makes
+	    a cheap version of this effect sound detached from the action.
+	  * Release 0.25s - the recovery, and the reason it is a quarter second
+	    rather than a frame. Snapping ambience back the instant the combat peak
+	    ends makes it pump audibly between clashes in a fast chain.
+]]
+local AUDIO_DUCK_THRESHOLD = -24
+local AUDIO_DUCK_RATIO = 4
+local AUDIO_DUCK_ATTACK = 0.01
+local AUDIO_DUCK_RELEASE = 0.25
+
+--[[
+	The limiter on the combat group, and why the duck above is not enough.
+
+	Ducking controls ambience relative to combat; it does nothing about combat
+	relative to *itself*. Twenty clashes inside one second sum to a signal well
+	past 0dBFS, which clips - and a clipped impact is the one sound in the game
+	that must never distort, because it is the sound carrying the reward.
+
+	A limiter is a compressor with the knee removed and the ratio taken to
+	infinity, so this is the same `CompressorSoundEffect` class with the
+	parameters of one: threshold just under full scale, a very high ratio, an
+	attack fast enough to catch a transient peak, and a release slow enough that
+	the gain reduction does not chatter between consecutive impacts.
+]]
+local AUDIO_LIMITER_THRESHOLD = -3
+local AUDIO_LIMITER_RATIO = 20
+local AUDIO_LIMITER_ATTACK = 0.001
+local AUDIO_LIMITER_RELEASE = 0.08
+
+--[[
+	Voice cap: the limiter's structural half.
+
+	Gain reduction keeps the *sum* inside full scale, but it cannot stop
+	forty simultaneous one-shots from sounding like a wall of noise. Capping
+	concurrent combat voices bounds the polyphony itself, so the stress suite's
+	twenty impacts in one second stay twenty *impacts* rather than becoming one
+	unrecognisable smear. Seven is roughly two full deflects per player in a
+	duel plus spares, which is above anything real gameplay produces and below
+	the level where the mix turns to mud.
+]]
+local AUDIO_VOICE_LIMIT = 7
+
+--[[
+	The 3D projection of a combat sound.
+
+	`MinDistance` is 7 studs, not 1. A clash the player's own blade made should
+	be *loud and unattenuated* - it is the sound of their decision - while one
+	that happened across the arena should arrive as a detail. A min distance of
+	1 stud would shrink that gap to almost nothing and make a point-blank
+	deflect indistinguishable from a distant one.
+
+	`MaxDistance` is 90 studs: beyond a duel, combat is not the subject of the
+	frame, and the group volume plus the duck handle the rest.
+]]
+local AUDIO_MIN_DISTANCE = 7
+local AUDIO_MAX_DISTANCE = 90
+
+--[[
+	The 4-part combat palette.
+
+	Four events, four recordings, chosen so that they separate on *timbre*
+	rather than on loudness - a player who cannot see the clash must still be
+	able to tell a deflect from a block from a slash. Every id is a free Creator
+	Store asset, verified loadable through `ContentProvider:PreloadAsync` before
+	being hardcoded, so none of these can fail to resolve at runtime.
+
+	`Deflect` is deliberately the same asset `DeflectFeedback` already plays
+	("Sword Impact 202"). Two recordings of the same event would mean the
+	deflect sounds different depending on which of two code paths noticed it,
+	and the player's ear would learn that as a bug. `PlaybackSpeed` 1.2 keeps
+	the established tight, high ring rather than a heavy thud.
+
+	`Block` is the dull low-end "Deep Impacts 7" - a guard absorbing a hit is
+	mass doing work, so it has almost no ring at all. Its near-absence of top
+	end is the whole reason it cannot be confused with the deflect.
+
+	`Slash` is the shortest asset in the set at 0.29s. A blade that connects is
+	a *cut*, and cuts are fast; the deflect can afford a 1.3s tail because a
+	clash is a sustained event and a slash is not.
+
+	`PostureBreak` is the wood-snap rupture. It is the worst sound in the game
+	by design - it is the sound of a guard failing - and it is played once, on
+	its own, at the moment the pool empties.
+]]
+local SOUND_DEFLECT: CombatSoundCue = table.freeze({
+	Id = "rbxassetid://9119747138",
+	Volume = 0.65,
+	PlaybackSpeed = 1.2,
+})
+local SOUND_BLOCK: CombatSoundCue = table.freeze({
+	Id = "rbxassetid://9114036511",
+	Volume = 0.55,
+	PlaybackSpeed = 0.95,
+})
+local SOUND_SLASH: CombatSoundCue = table.freeze({
+	Id = "rbxassetid://124971777918932",
+	Volume = 0.5,
+	PlaybackSpeed = 1.0,
+})
+local SOUND_POSTURE_BREAK: CombatSoundCue = table.freeze({
+	Id = "rbxassetid://9120801590",
+	Volume = 0.7,
+	PlaybackSpeed = 0.9,
+})
+
+--[[
+	The palette as one table, keyed by the cue name.
+
+	Declared here rather than assembled in `CombatAudio` so the asset ids live
+	beside every other tuning number in the project. A sound id hardcoded inside
+	a playback routine is a sound id nobody can find.
+
+	Not frozen per-entry beyond the entries above: `CombatAudio` reads it, and a
+	frozen table cannot be accidentally rewritten by a consumer's typo.
+]]
+local COMBAT_SOUND_PALETTE: { [CombatCue]: CombatSoundCue } = table.freeze({
+	Deflect = SOUND_DEFLECT,
+	Block = SOUND_BLOCK,
+	Slash = SOUND_SLASH,
+	PostureBreak = SOUND_POSTURE_BREAK,
+})
+
+--[[
+	Day 10 · Part 2/2 — the weapon trail's ignition.
+
+	Two colours and one duration. The resting palette is steel-blue through
+	white, and the ignited palette is a saturated gold through near-white; both
+	are four-stop gradients so the falloff shape survives the reskin rather than
+	the trail collapsing into a flat smear on the way to gold.
+
+	0.3s is chosen against the deflect's own 50ms hitstop: the ignition must
+	*outlast* the freeze, because the freeze is the frame the player is actually
+	looking at, and a tint that decayed inside the hitstop would be invisible at
+	the only moment it was meant to land.
+]]
+local TRAIL_IDLE_COLOR = table.freeze({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(38, 58, 112)),
+	ColorSequenceKeypoint.new(0.35, Color3.fromRGB(96, 150, 224)),
+	ColorSequenceKeypoint.new(0.72, Color3.fromRGB(186, 226, 255)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
+})
+local TRAIL_IGNITE_COLOR = table.freeze({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(120, 58, 8)),
+	ColorSequenceKeypoint.new(0.35, Color3.fromRGB(255, 158, 24)),
+	ColorSequenceKeypoint.new(0.72, Color3.fromRGB(255, 214, 102)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 250, 224)),
+})
+local TRAIL_IDLE_EMISSION = 0.8
+local TRAIL_IGNITE_DURATION = 0.3
+local TRAIL_IGNITE_EMISSION = 1.0
+
+--[[
+	Day 10 · Part 2/2 — the juice stress suite's shape.
+
+	Twenty impacts spread across one second. One second is the right window
+	because it is longer than the slowest thing that has to absorb them (the
+	duck's 0.25s release and the limiter's 0.08s) and short enough that all
+	twenty land inside a single audible burst, which is the only condition under
+	which the limiter and the trauma clamp are both actually under load.
+
+	`STEP` spaces the impacts evenly across the window instead of firing them in
+	one frame. Firing all twenty in a single frame would exercise the same code
+	paths but prove nothing about the *mix*: a real chain staggers its clashes,
+	and a limiter only earns its keep on a signal that arrives over time.
+]]
+local CHAOS_JUICE_IMPACTS = 20
+local CHAOS_JUICE_WINDOW = 1.0
+local CHAOS_JUICE_STEP = CHAOS_JUICE_WINDOW / CHAOS_JUICE_IMPACTS
 
 local AttackConfig = table.freeze({
 	COMBO_CHAIN = COMBO_CHAIN,
@@ -705,8 +995,48 @@ local AttackConfig = table.freeze({
 	DODGE_SPAM_COST_STEP = DODGE_SPAM_COST_STEP,
 	DODGE_SPAM_MAX_CHAIN = DODGE_SPAM_MAX_CHAIN,
 	DODGE_POSTURE_LOCKOUT = DODGE_POSTURE_LOCKOUT,
+	CAMERA_TRAUMA_DECAY_RATE = CAMERA_TRAUMA_DECAY_RATE,
+	CAMERA_TRAUMA_LIGHT_HIT = CAMERA_TRAUMA_LIGHT_HIT,
+	CAMERA_TRAUMA_DEFLECT = CAMERA_TRAUMA_DEFLECT,
+	CAMERA_TRAUMA_GUARD_BREAK = CAMERA_TRAUMA_GUARD_BREAK,
+	CAMERA_TRAUMA_RUPTURE = CAMERA_TRAUMA_RUPTURE,
+	CAMERA_SHAKE_ROTATION_DEGREES = CAMERA_SHAKE_ROTATION_DEGREES,
+	CAMERA_SHAKE_TRANSLATION_STUDS = CAMERA_SHAKE_TRANSLATION_STUDS,
+	CAMERA_SHAKE_ROTATION_FREQUENCY = CAMERA_SHAKE_ROTATION_FREQUENCY,
+	CAMERA_SHAKE_TRANSLATION_FREQUENCY = CAMERA_SHAKE_TRANSLATION_FREQUENCY,
+	FOV_PUNCH_DEGREES = FOV_PUNCH_DEGREES,
+	FOV_PUNCH_RETURN_DURATION = FOV_PUNCH_RETURN_DURATION,
+	DEFAULT_FIELD_OF_VIEW = DEFAULT_FIELD_OF_VIEW,
+	MIN_FIELD_OF_VIEW = MIN_FIELD_OF_VIEW,
+	HITSTOP_DEFAULT_DURATION = HITSTOP_DEFAULT_DURATION,
 	MAX_HIT_DISTANCE = MAX_HIT_DISTANCE,
 	ACTIVE_WINDOW_GRACE = ACTIVE_WINDOW_GRACE,
+	AUDIO_GROUP_MASTER = AUDIO_GROUP_MASTER,
+	AUDIO_GROUP_COMBAT_SFX = AUDIO_GROUP_COMBAT_SFX,
+	AUDIO_GROUP_AMBIENCE = AUDIO_GROUP_AMBIENCE,
+	AUDIO_MASTER_VOLUME = AUDIO_MASTER_VOLUME,
+	AUDIO_COMBAT_SFX_VOLUME = AUDIO_COMBAT_SFX_VOLUME,
+	AUDIO_AMBIENCE_VOLUME = AUDIO_AMBIENCE_VOLUME,
+	AUDIO_DUCK_THRESHOLD = AUDIO_DUCK_THRESHOLD,
+	AUDIO_DUCK_RATIO = AUDIO_DUCK_RATIO,
+	AUDIO_DUCK_ATTACK = AUDIO_DUCK_ATTACK,
+	AUDIO_DUCK_RELEASE = AUDIO_DUCK_RELEASE,
+	AUDIO_LIMITER_THRESHOLD = AUDIO_LIMITER_THRESHOLD,
+	AUDIO_LIMITER_RATIO = AUDIO_LIMITER_RATIO,
+	AUDIO_LIMITER_ATTACK = AUDIO_LIMITER_ATTACK,
+	AUDIO_LIMITER_RELEASE = AUDIO_LIMITER_RELEASE,
+	AUDIO_VOICE_LIMIT = AUDIO_VOICE_LIMIT,
+	AUDIO_MIN_DISTANCE = AUDIO_MIN_DISTANCE,
+	AUDIO_MAX_DISTANCE = AUDIO_MAX_DISTANCE,
+	COMBAT_SOUND_PALETTE = COMBAT_SOUND_PALETTE,
+	TRAIL_IDLE_COLOR = TRAIL_IDLE_COLOR,
+	TRAIL_IGNITE_COLOR = TRAIL_IGNITE_COLOR,
+	TRAIL_IDLE_EMISSION = TRAIL_IDLE_EMISSION,
+	TRAIL_IGNITE_DURATION = TRAIL_IGNITE_DURATION,
+	TRAIL_IGNITE_EMISSION = TRAIL_IGNITE_EMISSION,
+	CHAOS_JUICE_IMPACTS = CHAOS_JUICE_IMPACTS,
+	CHAOS_JUICE_WINDOW = CHAOS_JUICE_WINDOW,
+	CHAOS_JUICE_STEP = CHAOS_JUICE_STEP,
 })
 
 return AttackConfig

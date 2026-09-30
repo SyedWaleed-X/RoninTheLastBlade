@@ -222,6 +222,97 @@ local guardIsRaised = false
 local guardBlendValue = 0
 
 --[[
+	Day 10 · Part 2/2 — the trail ignition.
+
+	Two pieces of state and one reason. A deflect tints the blade's trail gold
+	for `TRAIL_IGNITE_DURATION` and then puts it back to steel, and the two
+	things that make that correct rather than flickery are both here:
+
+	  * `igniteGeneration` is an epoch, bumped on every ignition. The recovery
+	    is a `task.delay`, so two deflects inside one ignition window would
+	    otherwise have the *first* recovery land mid-second-ignition and snap
+	    the trail back to steel while the second deflect is still resolving. The
+	    epoch makes every stale recovery a no-op, which is the same rule
+	    `SparringDummy`'s `swingToken` and `GuardSparks`' generation stamp both
+	    use for the same reason.
+	  * `igniteTween` is held so a second ignition can cancel the first
+	    recovery tween. `TweenService` does not error on two tweens writing one
+	    property - they simply fight, and the loser is whichever finished first,
+	    so two overlapping tweens on `Color` produce a trail that strobes.
+
+	The tween is deliberately *not* registered with `Hitstop`. The 50ms freeze
+	is the frame the player is looking at, and a colour tween paused for the
+	duration of the freeze would not reach its gold until the freeze released -
+	landing the ignition on the one frame where the screen is already moving
+	again and the eye is looking elsewhere. The trail is not a body: nothing
+	about it needs to hold still for the hitstop to read.
+]]
+local igniteGeneration = 0
+local igniteTween: Tween? = nil
+
+--[[
+	Ignites the trail, then returns it to steel.
+
+	Snaps to the ignited palette instantly and eases *back* rather than easing
+	in and out. A deflect is a discrete event with a known instant, and the
+	player has to be able to see it at that instant - an ignition that fades up
+	over 300ms would spend most of its life at a colour that belongs to neither
+	state, and the reward would land as a smear rather than a flash.
+
+	The return is a tween over the same 0.3s. A hard cut back would read as a
+	second, separate event; the ease makes it decay.
+]]
+local function igniteTrail(trail: Trail)
+	if trail.Parent == nil then
+		return
+	end
+
+	igniteGeneration += 1
+	local myGeneration = igniteGeneration
+
+	-- Cancel any recovery still running, so it cannot fight the snap below.
+	local previousTween = igniteTween
+	if previousTween ~= nil then
+		previousTween:Cancel()
+		igniteTween = nil
+	end
+
+	trail.Color = ColorSequence.new(AttackConfig.TRAIL_IGNITE_COLOR)
+	trail.LightEmission = AttackConfig.TRAIL_IGNITE_EMISSION
+
+	task.delay(AttackConfig.TRAIL_IGNITE_DURATION, function()
+		-- A later ignition already claimed the trail; its own recovery owns it.
+		if igniteGeneration ~= myGeneration then
+			return
+		end
+
+		-- The character was destroyed inside the window (a respawn, or a death
+		-- on the same frame as the parry). Writing to a destroyed Trail is
+		-- work thrown away, and on a replacement trail it would be a colour
+		-- belonging to the previous life's blade.
+		if trail.Parent == nil then
+			return
+		end
+
+		local tween = TweenService:Create(
+			trail,
+			TweenInfo.new(
+				AttackConfig.TRAIL_IGNITE_DURATION,
+				Enum.EasingStyle.Quad,
+				Enum.EasingDirection.Out
+			),
+			{
+				Color = ColorSequence.new(AttackConfig.TRAIL_IDLE_COLOR),
+				LightEmission = AttackConfig.TRAIL_IDLE_EMISSION,
+			}
+		)
+
+		igniteTween = tween
+		tween:Play()
+	end)
+end
+
+--[[
 	Day 7 · Part 1/2 — the locomotion bleed lock.
 
 	This is the one per-frame write in the whole module that is NOT the guard pose,
@@ -783,16 +874,23 @@ local function equip(character: Model)
 	trail.Attachment1 = bladeTip
 	trail.Lifetime = 0.12
 	trail.MinLength = 0.05
-	trail.LightEmission = 0.8
 	trail.FaceCamera = true
 
-	-- White-hot at the point, cooling to steel blue along the arc.
-	trail.Color = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, Color3.fromRGB(38, 58, 112)),
-		ColorSequenceKeypoint.new(0.35, Color3.fromRGB(96, 150, 224)),
-		ColorSequenceKeypoint.new(0.72, Color3.fromRGB(186, 226, 255)),
-		ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
-	})
+	--[[
+		Day 10 · Part 2/2: the colour and emission now come from `AttackConfig`
+		rather than being written here.
+
+		They used to be literals at this site. They are config for the same
+		reason the deflect's volume is: a parry *ignites* this trail, and the
+		ignition and the resting palette have to be the same pair of values or
+		the trail snaps between two colours it was never drawn to have. Split
+		across two files, the pair drifts and the reskin lands halfway.
+	]]
+	trail.Color = ColorSequence.new(AttackConfig.TRAIL_IDLE_COLOR)
+	trail.LightEmission = AttackConfig.TRAIL_IDLE_EMISSION
+
+	-- White-hot at the point, cooling to steel blue along the arc. The gradient
+	-- itself now lives in `AttackConfig.TRAIL_IDLE_COLOR` (see above).
 
 	-- Nearly opaque at the point, gone by the oldest segment.
 	trail.Transparency = NumberSequence.new({
@@ -901,6 +999,19 @@ local function equip(character: Model)
 			if trail.Parent then
 				trail.Enabled = enabled
 			end
+		end,
+		--[[
+			Day 10 · Part 2/2: the deflect's ignition, delegated to the module-level
+			`igniteTrail` that owns the epoch and the recovery tween.
+
+			Published rather than inlined so the epoch cannot be per-rig. Two
+			rigs each counting their own generations would let a stale recovery
+			from the previous character's trail fire against the new one; one
+			module-level epoch means a respawn during an ignition window retires
+			every pending recovery at once.
+		]]
+		IgniteTrail = function()
+			igniteTrail(trail)
 		end,
 		StartSwing = function(_hitIndex: number, _windup: number, _active: number, _recovery: number)
 			-- The shoulder is the swing driver now (see the header), so the blade needs
