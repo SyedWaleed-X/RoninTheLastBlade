@@ -1,46 +1,48 @@
 # RONIN: ACTIVE CONTEXT RELAY
-*Last Updated: End of Day 10 (Part 2/2)*
+*Last Updated: End of Day 11 (Boss 1 + Realm 1)*
 
 ## 1. Project Phase
-- Completed: Days 1-4, Day 5 P1/2 + P2/2, Day 6 P1/2 + P2/2, Day 7 P1/2 + P2/2, Day 8 P1/2 + P2/2, Day 9 P1/2 + P2/2, **Day 10 P1/2 + P2/2**.
-- Next Up: Day 11 - `Executing` / Deathblow off a broken guard, plus the four region instances behind the torii.
+- Completed: Days 1-4, 5-10 (all parts), **Day 11: THE CORRUPTED COMMANDER + The Burning Ash Courtyard**.
+- Next Up: Day 12 - `Executing` / Deathblow cinematically, then the remaining three regions behind the torii.
 
 ## 2. Live System Registry
-- `src/server/ServerScriptService/AudioEngine.server.luau` (**new** - builds the SoundService mix tree: `RoninMaster` over `RoninCombatSFX` (limiter) and `RoninAmbience` (duck); reads the tree back and warns on an unbound `SideChain`)
-- `src/client/StarterPlayerScripts/CombatAudio.luau` (**new** - `PlayCue(cue, position)`; per-cue voice pools with oldest-steal; `Block`/`Slash` self-triggered, `Deflect`/`PostureBreak` driven by CombatController)
-- `src/server/ServerScriptService/SparringDummy.server.luau` (**+** `RoninInvulnerable` read in `resolveStrike`, after range/LOS and *before* the guard, printing `[DUMMY EVADED]`)
-- `src/client/StarterPlayerScripts/CombatController.local.luau` (**+** `CombatAudio` require; `Deflect` cue + `rig:IgniteTrail()` on the defender, `Deflect` cue only on the attacker, `PostureBreak` on guard break)
-- `src/client/StarterPlayerScripts/WeaponVisuals.local.luau` (**+** `igniteTrail` with an epoch + cancellable recovery tween; `IgniteTrail` on the `BladeRig` seam; trail colour/emission now from config)
-- `src/client/StarterPlayerScripts/CombatStateBus.luau` (**+** `IgniteTrail` on the `BladeRig` type)
-- `src/client/StarterPlayerScripts/CombatDebugUI.local.luau` (**+** Key `[U]` `runJuiceChaosSuite`, 5 invariants, reuses `chaosSuiteRunning` + `InputGate`)
-- `src/shared/ReplicatedStorage/AttackConfig.luau` (**+** 26 constants + `CombatSoundCue` / `CombatCue` types)
-- Unchanged: `StateMachine` / `CombatTypes` / `InputBinder` / `InputBuffer` / `InputGate` / `PostureEngine` / `PostureChaos` / `TestFSM` / `HitValidator` / `AttackController` / `BladeHitbox` / `ParryWindow` / `GuardSparks` / `DeflectFeedback` / `Hitstop` / `DodgeController` / `CameraShaker` / `Workspace.SanctuaryHub` / `Lighting`
+- `src/server/ServerScriptService/Arena1Builder.server.luau` (**new**) - 80x80 courtyard, 6 braziers, ash, two-leaf gate, **and the Commander itself** (`buildCommander` / `buildBrazier` native templates via `resolveTemplate`)
+- `src/server/ServerScriptService/Boss1Controller.server.luau` (**new**) - 5-move AI on a 50ms `task.wait` loop, pose table, telegraph channel, posture economy, phase 2, engage/disengage, defeat/revive
+- `src/shared/ReplicatedStorage/BossConfig.luau` + `BossRegistry.luau` (**new**) - every boss number in one frozen table; the two-way player<->boss strike bridge
+- `src/client/StarterPlayerScripts/BossHUD.local.luau` (**new**) - nameplate, interpolating health bar, posture bar, phase pips
+- `src/server/ServerScriptService/HitValidator.server.luau` (**+** boss branch routes a player hit to `BossRegistry`; `resolveBossStrikeOnPlayer` resolves boss->player through the *existing* guard/parry/dodge chain; `findRoot` hardened)
+- Unchanged: everything from Days 1-10.
 
-## 3. The Mix Tree
-Three groups, nested so one master fader owns both leaves. The limiter sits on `CombatSFX` and the duck on `RoninAmbience` - never on the master, or the limiter would fight the duck release and the bed would stutter recovering. **The legacy `SoundGroup` tree is the correct tool, not a deprecated one:** the newer `AudioPlayer`/`AudioCompressor` API has no SoundGroup, and ducking a whole ambience bucket is not expressible as a wire between two players.
+## 3. Active Invariants (new this part)
+1. **The Commander is a native rig, not an imported one.** `buildCommander` writes every Part/Motor6D from script; `C0 = p0.CFrame:ToObjectSpace(p1.CFrame)` holds the authored pose with no `Animate` script. An authored `BossTemplates.CorruptedCommander` still wins if present.
+2. **`CanQuery = true` on every boss part.** `CanCollide = false` stops it snagging on scenery, but `CanQuery = false` made it *invisible to spatial queries* - the player's katana passed straight through and the boss sat at a permanent 400 HP. Queryability beats tidiness.
+3. **Joints resolve by descendant search.** R15 parents `Root` in `LowerTorso`, `Waist` in `UpperTorso`, `Neck` in `Head`. A direct `FindFirstChild` on the Model finds nothing and the failure is a silent nil - every pose degrades to a no-op and the telegraphs simply do not exist.
+4. **`AutoRotate` must stay ON.** The controller faces the player only via `Humanoid:Move`, which turns a character only when it is enabled. Off, the boss slides past and its forward-cone check never passes - a fight that runs and lands nothing.
+5. **Boss identity is resolved by walking *up*.** The hitbox reports the inner `Rig`, not the Model carrying the attributes, so `IsBoss` walks ancestors and every consumer is handed the canonical Model.
+6. **Handles are addressed by name, not attribute.** An Instance-valued attribute reads back as `InstanceHandle` (S4), so `TheCorruptedCommander` / `GateLeafLeft` / `GateLeafRight` / `ARENA_Burn_Grade` are found by name. `RoninArenaReady` stays an attribute - a boolean, written last, as the ordering promise.
+7. **The per-swing latch clears per *move*, not per call.** `fireSwing` is entered 2-4x per swing; clearing inside it re-armed the latch each tick and a 12 HP flurry step landed 2-4x.
 
-## 4. Active Invariants (new this part)
-1. **The dummy now honours i-frames.** It is a *second* strike authority: `HitValidator` has read `RoninInvulnerable` since Day 9, the dummy never did. The rule existed; the file just never asked. Checked after range/LOS and before the guard, so an evaded strike reports "evaded" rather than "blocked".
-2. **A client attribute write does not reach the server.** Verified live: pinning `RoninInvulnerable` from the Client datamodel left the dummy dealing full damage. The server is the only writer.
-3. **A duck whose `SideChain` fails to bind fails silently.** Both buses still play; the only symptom is a bed slightly too present, which reads as taste. Hence the read-back print and warning in `AudioEngine`.
-4. **The Creator Hub sidechain sample is wrong.** It documents `MakeUpGain`; the class exposes `GainMakeup`. Verified: `GainMakeup` reads, `MakeUpGain` errors. Setting the documented name is a silent no-op.
-5. **The engine rejects a multi-line `if` expression with a leading `else`.** Ours did, all three. `then` on its own line is fine - the killer is a bare `else` starting a line.
-6. **Reward asymmetry is preserved.** Defender: clang + 3D cue + gold trail + FOV punch + trauma. Attacker: clang + 3D cue, no ignition, no zoom, no shake.
 
-## 5. Verification Results (Day 10 P2/2)
-- **Strict boot**: all 15 modules online, zero errors, zero warnings.
-- **Mix tree (live)**: mix tree online, RoninMaster 1.00 over [RoninCombatSFX 1.00 + limiter | RoninAmbience 0.70 ducked]; duck side-chained by RoninCombatSFX at -24dB / 4:1 / 10ms / 0.25s; limiter at -3dB / 20:1.
-- **Dodge evasion (live, server-side flag)**: 3x `[DUMMY EVADED]`, Health held 100/100 across 3+ strike cycles; on release the dummy resumed `[DUMMY HIT CONFIRMED]` for 10 HP, proving the fix evades only while invulnerable.
-- **Chaos suite [U]**: 5/5 PASS - trauma peak 1.000 over 20 impacts (clamped, no runaway), decay 0.906 to 0.345, mix tree intact, voice cap 7 of 7, 20 of 20 impacts reached the pool.
-- **All 4 audio ids** verified loadable via `ContentProvider:PreloadAsync` before being hardcoded.
+## 4. Engine Changes That Broke Working Code (Sept 2026 build)
+- **`Motor6D.Priority` removed** (Avatar Joint Upgrade) - raised at load. It only existed to out-rank `Animate`, which this rig does not have.
+- **`Enum.FloorMaterial` removed**; `Humanoid.FloorMaterial` now returns an `Enum.Material`. The low sweep's must-jump test is now `GetState() == Freefall or Jumping`.
+- **`GuiObject.GroupTransparency` / `GroupColor3` removed** - the HUD fade was a `CanvasGroup` tween, now a per-descendant tween walk over a plain `Frame`. **`CombatDebugUI` still uses `GroupTransparency` and is broken by this** (carried).
+- **`TextLabel.Transparency` and `TextTransparency` are no longer aliases** - a fade driven by `Transparency` left the nameplate invisible while every bar faded correctly.
+- **Instance-valued attributes return `InstanceHandle`**, which has no `FindFirstChild` and cannot answer `IsA`.
+- *Editor notes: `execute_luau` has no `readfile`/`loadstring`; `gmatch` with `"[^\n]*"` double-counts lines; PowerShell `-like` treats `[...]` as a character class; CRLF files need UTF-8-no-BOM writes.*
 
-## 6. Known Gaps - Next Task (Day 11)
-- **No `Executing` / Deathblow.** In the state table with nothing driving it. The guard break is the natural trigger and the cue plumbing now exists.
-- **A deflect plays two sounds.** The Day 7 non-spatial `DeflectFeedback.Clang()` still fires alongside the new spatial cue. Recommended: retire `Clang()` so the palette owns deflects alone. **Not done - awaiting a call.**
-- **A block plays both** the Day 7 sparks event and the new `Block` thud; same double-sound question, smaller stakes.
-- **`WeaponVisuals` pose tweens are not registered** with `Hitstop` - only the dodge lean is (carried). The ignition tween is deliberately *not* registered, so the gold lands on the frozen frame.
-- **The lean is still not seen by opponents** (client-local `C0` write) - carried from Day 9 P2/2.
-- **`CameraShaker` has no HUD row** - `GetTrauma()` exists, `CombatDebugUI` does not read it (carried).
-- **The hub gates lead nowhere** - carried; regions and portals are Day 11.
-- **Tooling (extended):** the filesystem `edit` tool is unavailable; edits go through PowerShell. `CombatDebugUI.local.luau` is LF in git and `CombatAudio.luau` is CRLF - match the file own endings or replacements silently miss. **Edit-mode `require` of a runtime-created ModuleScript is NOT a valid syntax oracle** (it rejected a valid if-expression *and* a trivial control): trust only a live playtest. `Enum.RollOffMode` is `InverseTapered`, not `InverseTaper`. `FireServer` from the Server datamodel throws. Named returns in a tuple are invalid in a return-type position.
-- **Editor gotchas (carried):** repeated `insert_line`-ing on one comment anchor corrupts a file; prefer line-index splices. `loadstring` is unavailable in `execute_luau`.
+## 5. Verification Results (Day 11, live)
+- **Strict boot**: zero errors, zero warnings across all server + client scripts.
+- **Arena**: `80x80 at (0, 0, -116), 6 braziers, boss placed`; gate seals on engage and opens on defeat; grade + taiko bed (`SoundGroup = RoninAmbience`) on engage.
+- **Boss**: `400 HP, 200 posture, 5 moves, 50ms cadence`; all five attributes exact; katana welded `part0=RightHand`; all 7 pose joints resolve.
+- **All 5 moves observed live**: Flurry (12/12/16), Cleave (26, amber), Perilous Thrust (30, red + kanji, *pierced guard*), Low Sweep (35, `LEAPT the low sweep!`), Shadow Retreat + lunge.
+- **Both directions**: `[BOSS HIT] ... struck TheCorruptedCommander for 24 - applied=true reason=hit`; boss 400->342 with posture 29.75/200.
+- **Lifecycle**: `already defeated` -> `The Commander rises again.` -> gate re-seals -> re-engages.
+- **Cadence**: 28 hits / 10s, avg exactly 12.0 (a 3-hit flurry roughly once a second).
+- **HUD**: `Name` alpha 0.00, text `THE CORRUPTED COMMANDER`, stroke 0.55; health fill 0.577 = 231/400; posture fill tracks; pips lit.
+
+## 6. Known Gaps - Next Task (Day 12)
+- **No `Executing` / Deathblow.** `Vulnerable` opens the window and `BrokenHealthMultiplier` (1.6) is now read, but nothing plays a finisher.
+- **`CombatDebugUI` uses the removed `GroupTransparency`** - its fade and vignette are dead on this engine. Same fix as `BossHUD` (S4).
+- **`SanctuaryHub.CourtyardFloor` is 1x104x104 rotated Z=90** - correct as a floor, but it reads as a wall in the Explorer. Left alone; worth renaming.
+- **Carried from Day 10**: a deflect plays two sounds (`DeflectFeedback.Clang` plus the palette cue); `WeaponVisuals` pose tweens are not registered with `Hitstop`; the lean is client-local; `CameraShaker` has no HUD row; the other three torii gates lead nowhere.

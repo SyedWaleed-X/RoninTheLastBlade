@@ -49,6 +49,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local AttackConfig = require(ReplicatedStorage:WaitForChild("AttackConfig") :: ModuleScript)
 
+local BossRegistry = require(ReplicatedStorage:WaitForChild("BossRegistry") :: ModuleScript)
+
 --[[
 	Frozen frame data and the shared wire contract, read once at module scope.
 
@@ -282,13 +284,34 @@ end
 	Resolves the root part of a character, or nil. Split find and cast so the nil test
 	runs before the cast narrows a value the checker already knows is present.
 ]]
+--[[
+	Finds a character's `HumanoidRootPart`.
+
+The direct-child lookup is tried first because it is the cheap and correct
+answer for a player character, and then a bounded descendant search runs behind
+it. The fallback exists for the Commander: a character rig keeps its root inside
+the inner `Rig` model, so when the boss controller hands this function the *outer*
+boss Model - which is what carries the five server attributes, and therefore what
+the registry resolves every reference to - a direct `FindFirstChild` returns nil
+and every boss strike resolves as "missing root part" without ever reaching the
+	guard, the parry window or the damage call.
+
+	`IsA("BasePart")` rather than a name match, so a decorative part called
+"HumanoidRootPart" on a non-rig cannot be mistaken for one.
+]]
 local function findRoot(model: Model): BasePart?
-	local instance = model:FindFirstChild("HumanoidRootPart")
-	if instance == nil or not instance:IsA("BasePart") then
-		return nil
+	local direct = model:FindFirstChild("HumanoidRootPart")
+	if direct ~= nil and direct:IsA("BasePart") then
+		return direct :: BasePart
 	end
 
-	return instance :: BasePart
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") and descendant.Name == "HumanoidRootPart" then
+			return descendant :: BasePart
+		end
+	end
+
+	return nil
 end
 
 
@@ -1185,6 +1208,51 @@ hitEvent.OnServerEvent:Connect(function(player: Player, target: any, hitIndex: a
 
 	struckTargets[targetModel] = true
 
+--[[
+A boss target. Reached only after the entire gauntlet above has passed: a
+live Active window whose hit index matches, a target that is not the
+attacker, this swing's one-contact debounce, server-side range, and a real
+line of sight. A client cannot damage the Commander without spending a real
+swing at a real distance through real space.
+
+Only the *consequences* are forwarded. Everything that decides whether the
+hit was allowed stays on this side, which is the whole point: the boss is
+not a second, easier authority, it is the same authority aimed somewhere
+else.
+
+Placed after `struckTargets` and before the i-frame read for the same
+ordering reason the rest of this function documents: a boss that was
+successfully struck has still spent its one contact on that target.
+]]
+	if BossRegistry.IsBoss(targetModel) then
+		-- The canonical boss Model, because `targetModel` is whatever the hitbox
+		-- reported and on a character rig that is the inner `Rig`, which carries
+		-- none of the five attributes.
+		local boss = BossRegistry.ResolveBoss(targetModel)
+		local bossResult = BossRegistry.ApplyStrike(character, targetModel, data.Damage, data.PoiseDamage, hitIndex)
+
+		local postureNow = boss and boss:GetAttribute(BossRegistry.Attributes.Posture) or 0
+		local postureMax = boss and boss:GetAttribute(BossRegistry.Attributes.MaxPosture) or 0
+
+		-- `Reason` is printed, not just the booleans. A boss that refuses a hit
+		-- because no resolver installed itself and a boss that refuses one because
+		-- it is already defeated are the same two `false`s, and the first is a
+		-- wiring fault while the second is the fight working.
+		print(string.format(
+			"[BOSS HIT] %s struck %s for %d - applied=%s defeated=%s posture=%s/%s reason=%s",
+			character.Name,
+			boss and boss.Name or targetModel.Name,
+			data.Damage,
+			tostring(bossResult.Applied),
+			tostring(bossResult.Defeated),
+			tostring(postureNow),
+			tostring(postureMax),
+			bossResult.Reason
+		))
+
+		return
+	end
+
 	--[[
 		Day 9 · Part 1/2: the dodge, resolved.
 
@@ -1364,6 +1432,141 @@ end)
 	handle "absent" separately from "0", and the two would drift apart the first time
 	one of them was written and the other was not.
 ]]
+--[[
+Boss -> player resolution.
+
+Direction 2 of the registry contract, and the reason this function is here and
+not in `Boss1Controller`: everything below is a rule about a *player's* guard,
+parry window or posture pool, and `HitValidator` already owns all three. If the
+boss controller re-derived any of it there would be two answers to one question,
+and the two would drift the first time `PARRY_BASE_WINDOW` or the posture
+recovery curve changed.
+
+So the controller decides *that* a swing reached somebody and passes the contact
+point and the move's flags; this decides *what that costs*.
+
+The three flags are consulted in a fixed order, and the order is the design:
+
+  1. `MustJump` first and alone. It ignores the i-frame dodge entirely - a
+     committed dodge is a horizontal step (COMBAT_SPEC S3) and this blade is at
+     ankle height, so sliding sideways is not an escape. `FloorMaterial == Air`
+     is the only answer, and it is read on the frame of contact rather than at
+     any point in the windup, so a hop that has already landed does not save you.
+  2. `Unblockable` next. The i-frame dodge answers it completely; the guard and
+     the parry are not consulted at all. This is what makes a perilous move
+     perilous - block and parry are not partial answers, they are no answers.
+  3. Otherwise, the ordinary chain: i-frames, then the parry window, then the
+     frontal guard cone, then full damage. That is the same order, and the same
+     helpers, the player's own `HitValidator` path uses.
+
+Returns a short verb for the console so a trace reads the way the rest of the
+project's traces do.
+]]
+local function resolveBossStrikeOnPlayer(boss: Model, victim: Model, kind: BossRegistry.BossStrikeKind): string
+local targetHumanoid = victim:FindFirstChildOfClass("Humanoid")
+if targetHumanoid == nil or targetHumanoid.Health <= 0 then
+return "no living humanoid"
+end
+
+local victimRoot = findRoot(victim)
+local bossRoot = findRoot(boss)
+if victimRoot == nil or bossRoot == nil then
+return "missing root part"
+end
+
+-- 1. Perilous low sweep: only vertical separation answers it. ------------------
+if kind.MustJump then
+		--[[
+		Airborne, via the Humanoid state machine.
+
+		This test used to be `FloorMaterial == Enum.FloorMaterial.Air`, and that
+		expression no longer exists: `Enum.FloorMaterial` was removed from the engine
+		and `Humanoid.FloorMaterial` now reports an `Enum.Material` surface type, so
+		there is no "Air" member left to compare against and the old line raises
+		"FloorMaterial is not a valid member of Enum" the first time a low sweep
+		connects.
+
+		`GetState()` is the supported answer to "is this character off the ground" and
+		it is strictly better than a height or velocity check for the reason the brief
+		gives: it is true for the whole airborne arc and false the instant a foot
+		touches down, so a hop that has already landed does not save you. `Climbing`
+		and `Swimming` are deliberately not airborne - a player on a wall is not
+		above the blade.
+
+		`pcall` because a stripped or half-built character must read as grounded
+		rather than as a type error inside the hit path.
+		]]
+		local airborne = false
+		local stateOk, state = pcall(function() return targetHumanoid:GetState() end)
+		if stateOk and state ~= nil then
+			airborne = state == Enum.HumanoidStateType.Freefall
+				or state == Enum.HumanoidStateType.Jumping
+		end
+
+		if airborne then
+			print(string.format("[BOSS] %s LEAPT the low sweep!", victim.Name))
+			return "JUMPED"
+		end
+targetHumanoid:TakeDamage(kind.Damage)
+print(string.format("[BOSS] Low sweep caught %s for %d HP", victim.Name, kind.Damage))
+return "SWEPT"
+end
+
+-- 2. The i-frame dodge. Checked before the guard for the reason the player-side
+-- path checks it there: invulnerability is a stronger claim than a block.
+if victim:GetAttribute(INVULNERABLE_ATTRIBUTE) == true then
+print(string.format("[BOSS] %s i-framed through the Commander's strike!", victim.Name))
+return "EVADED"
+end
+
+-- 3. Unblockable: guard and parry are not answers at all. -------------------
+if kind.Unblockable then
+targetHumanoid:TakeDamage(kind.Damage)
+print(string.format(
+"[BOSS] Perilous thrust pierced %s's guard for %d HP",
+victim.Name,
+kind.Damage
+))
+return "PIERCED"
+end
+
+-- 4. The ordinary chain: parry, then guard, then damage. --------------------
+local parryWindow = readParryWindow(victim)
+if parryWindow > 0 then
+closeParryWindow(victim)
+deflectClashEvent:FireAllClients(kind.ContactPoint)
+print(string.format("[BOSS DEFLECT] %s parried the Commander!", victim.Name))
+return "PARRIED"
+end
+
+local isBlocked, dotProduct = resolveGuard(victim, victimRoot, bossRoot)
+if isBlocked then
+guardClashEvent:FireAllClients(kind.ContactPoint)
+local posture, maxPosture, isBroken = spendPosture(victim, kind.Posture)
+
+print(string.format(
+"[BOSS GUARD] %s blocked for %d posture (Dot: %.3f, %d/%d)",
+victim.Name, kind.Posture, dotProduct, posture, maxPosture
+))
+
+if isBroken then
+breakGuard(victim)
+print(string.format("[BOSS GUARD BREAK] %s's posture shattered!", victim.Name))
+end
+
+return "BLOCKED"
+end
+
+targetHumanoid:TakeDamage(kind.Damage)
+print(string.format("[BOSS HIT] %s took %d HP from the Commander", victim.Name, kind.Damage))
+return "HIT"
+end
+
+--[[
+Install it. Registration happens once, at load, before any boss exists - the
+controller asks for the resolver when it swings, and it is already there.
+]]
+BossRegistry.SetPlayerStrikeResolver(resolveBossStrikeOnPlayer)
 local function seedPosture(character: Model)
 	ensurePosture(character)
 	closeParryWindow(character)

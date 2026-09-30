@@ -13,3 +13,6 @@
 3. THE HANDOVER PROTOCOL (MANDATORY):
    - As your final action before completing any milestone, inspect and update `docs/ACTIVE_CONTEXT.md`.
    - Keep `docs/ACTIVE_CONTEXT.md` compact (<60 lines). Record newly created files, active invariants, and the immediate next roadmap task.
+
+4. CREATOR STORE HYGIENE:
+   - When importing models from the Creator Store, immediately strip and destroy any embedded Scripts, LocalScripts, or ModuleScripts inside the model. Models must ONLY contain visual MeshParts, Parts, and Textures.
