@@ -1,0 +1,180 @@
+# ---------------------------------------------------------------------------
+# Self test
+#
+# Round-trips the encoder. The generator is a hand-rolled binary writer, and the
+# one thing reading the file back cannot tell you for free is whether the
+# interleave stride is right: a wrong stride still yields a file that loads, still
+# yields a file that animates, and still yields a file that looks like a sword
+# swing. It is only wrong in the numbers. So decode what was encoded and compare.
+#
+# Everything else about the four clips - the keyframe times, the angles, the pose
+# tree - is data, and data is checked by reading it.
+# ---------------------------------------------------------------------------
+
+function Read-RobloxFloat32([byte[]] $Bytes, [int] $Offset) {
+	<# Undo the sign-bit rotation that `Write-RobloxFloat32` applied. #>
+	$rot = [uint32] (([uint32] $Bytes[$Offset]) -bor
+		(([uint32] $Bytes[$Offset + 1]) -shl 8) -bor
+		(([uint32] $Bytes[$Offset + 2]) -shl 16) -bor
+		(([uint32] $Bytes[$Offset + 3]) -shl 24))
+	$sign = $rot % 2
+	$rest = ($rot - $sign) / 2
+	$bits = [uint32] ($rest + ([uint32] 2147483648 * $sign))
+	return [BitConverter]::ToSingle([BitConverter]::GetBytes($bits), 0)
+}
+
+function Get-AxisAngleMatrix {
+	<#
+		PowerShell has no `CFrame`, so the small part of it this test needs is
+		spelled out: Rodrigues' rotation formula, as a 3x3, from a unit axis and
+		an angle.
+	#>
+	param([double] $X, [double] $Y, [double] $Z, [double] $Angle)
+
+	$length = [Math]::Sqrt($X * $X + $Y * $Y + $Z * $Z)
+	if ($length -lt 1.0e-9) {
+		# Identity: `Get-EulerToAxisAngle` never produces this, but a degenerate
+		# axis must still be handled rather than producing NaNs.
+		return @(@(1.0, 0, 0), @(0, 1.0, 0), @(0, 0, 1.0))
+	}
+	$x = $X / $length; $y = $Y / $length; $z = $Z / $length
+
+	$c = [Math]::Cos($Angle); $s = [Math]::Sin($Angle); $t = 1 - $c
+	return @(
+		@($t * $x * $x + $c,       $t * $x * $y - $s * $z,  $t * $x * $z + $s * $y),
+		@($t * $x * $y + $s * $z,  $t * $y * $y + $c,       $t * $y * $z - $s * $x),
+		@($t * $x * $z - $s * $y,  $t * $y * $z + $s * $x,  $t * $z * $z + $c)
+	)
+}
+
+function Get-EulerMatrix([double] $Rx, [double] $Ry, [double] $Rz) {
+	<#
+		The X-Y-Z rotation the generator decomposes, as a matrix.
+
+		Verified against the engine rather than assumed: `CFrame.Angles(x, y, z)` is
+		exactly `CFrame.Angles(x,0,0) * CFrame.Angles(0,y,0) * CFrame.Angles(0,0,z)`,
+		measured in Studio. Getting that order wrong yields swings that still look
+		like swings, so it is written out here rather than left to judgement.
+	#>
+	$cx = [Math]::Cos($Rx); $sx = [Math]::Sin($Rx)
+	$cy = [Math]::Cos($Ry); $sy = [Math]::Sin($Ry)
+	$cz = [Math]::Cos($Rz); $sz = [Math]::Sin($Rz)
+	return @(
+		@($cz * $cy,                       $cz * $sy * $sx - $sz * $cx,  $cz * $sy * $cx + $sz * $sx),
+		@($sz * $cy,                       $sz * $sy * $sx + $cz * $cx,  $sz * $sy * $cx - $cz * $sx),
+		@(-$sy,                            $cy * $sx,                    $cy * $cx)
+	)
+}
+
+function Get-MatrixDelta($A, $B) {
+	<#
+		Largest element-wise difference.
+
+		A rotation has two valid axis+angle encodings, so this compares reconstructed
+		matrices and never the raw numbers.
+	#>
+	$worst = 0.0
+	for ($r = 0; $r -lt 3; $r++) {
+		for ($c = 0; $c -lt 3; $c++) {
+			$d = [Math]::Abs($A[$r][$c] - $B[$r][$c])
+			if ($d -gt $worst) { $worst = $d }
+		}
+	}
+	return $worst
+}
+
+
+function Invoke-SelfTest {
+	<#
+		Four rotations, chosen to cover what breaks: the identity, which takes the
+		one-byte format and contributes no record at all; a single-axis twist; a
+		ninety-degree turn, where a wrong composition order is most visible; and a
+		compound rotation.
+	#>
+	$cases = @(
+		@{ Rx = 0.0;  Ry = 0.0;  Rz = 0.0 },
+		@{ Rx = 30.0; Ry = 0.0;  Rz = 0.0 },
+		@{ Rx = 0.0;  Ry = 90.0; Rz = 0.0 },
+		@{ Rx = 12.0; Ry = -34.0; Rz = 56.0 }
+	)
+
+	$buffer = New-Object System.Collections.Generic.List[byte]
+	Write-CFrameBlock $cases $buffer
+	$bytes = $buffer.ToArray()
+
+	$count = $cases.Count
+	$expectedLength = $count + (16 * ($count - 1)) + (12 * $count)
+	Write-Host ('  block: ' + $bytes.Length + ' bytes for ' + $count + ' cframes (expected ' + $expectedLength + ')') -ForegroundColor DarkGray
+	if ($bytes.Length -ne $expectedLength) {
+		throw ('Self test: block is ' + $bytes.Length + ' bytes, expected ' + $expectedLength + '.')
+	}
+
+	# Byte 0 is the type tag the PROP chunk already consumed. The rotation-format
+	# bytes follow as a plain, un-interleaved run - one per cframe.
+	$nonIdentity = 0
+	for ($i = 0; $i -lt $count; $i++) {
+		if ($bytes[1 + $i] -ne 0) { $nonIdentity++ }
+	}
+
+	# Identity writes format byte 0 and no record, so the axis block holds only the
+	# non-identity rotations and its stride is THAT count, not the pose count. Using
+	# the pose count here is the exact bug this test exists to catch.
+	$axisOffset = 1 + $count
+	$failures = 0
+	$checked = 0
+	$index = 0
+
+	for ($i = 0; $i -lt $count; $i++) {
+		if ($bytes[1 + $i] -eq 0) { continue }
+
+		$values = @()
+		for ($k = 0; $k -lt 4; $k++) {
+			$values += Read-RobloxFloat32 $bytes ($axisOffset + $k * 4 * $nonIdentity + $index)
+		}
+
+		$decoded = Get-AxisAngleMatrix $values[0] $values[1] $values[2] $values[3]
+		$expected = Get-EulerMatrix `
+			([Math]::PI * $cases[$i].Rx / 180) `
+			([Math]::PI * $cases[$i].Ry / 180) `
+			([Math]::PI * $cases[$i].Rz / 180)
+		$delta = Get-MatrixDelta $decoded $expected
+
+		$label = sprintf('(%s, %s, %s) deg', $cases[$i].Rx, $cases[$i].Ry, $cases[$i].Rz)
+		if ($delta -gt 1.0e-4) {
+			$failures++
+			Write-Host ('    FAIL ' + $label + '  max matrix delta ' + $delta) -ForegroundColor Red
+		}
+		else {
+			Write-Host ('    ok   ' + $label + '  axis=(' +
+				[Math]::Round($values[0], 3) + ', ' + [Math]::Round($values[1], 3) + ', ' +
+				[Math]::Round($values[2], 3) + ')  angle=' +
+				[Math]::Round($values[3] * 180 / [Math]::PI, 2) + ' deg') -ForegroundColor DarkGray
+		}
+		$checked++
+		$index++
+	}
+
+	# Positions are one all-zero triple per pose, interleaved on the FULL count.
+	$positionOffset = $axisOffset + 16 * $nonIdentity
+	for ($i = 0; $i -lt $count; $i++) {
+		for ($k = 0; $k -lt 3; $k++) {
+			$v = Read-RobloxFloat32 $bytes ($positionOffset + $k * 4 * $count + $i)
+			if ([Math]::Abs($v) -gt 1.0e-6) {
+				$failures++
+				Write-Host ('    FAIL position ' + $i + ' component ' + $k + ' = ' + $v) -ForegroundColor Red
+			}
+		}
+	}
+
+	if ($failures -gt 0) {
+		throw ('Self test failed: ' + $failures + ' mismatch(es) across ' + $checked + ' rotations.')
+	}
+	Write-Host ('  Self test passed: ' + $checked + ' rotations round-tripped, all positions zero.') -ForegroundColor Green
+}
+
+if ($SelfTest) {
+	Write-Step 'Self test: binary encoder round-trip'
+	Invoke-SelfTest
+	Write-Step 'Self test complete.'
+	return
+}

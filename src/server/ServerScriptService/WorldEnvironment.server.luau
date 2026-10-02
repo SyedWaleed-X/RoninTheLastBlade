@@ -2840,6 +2840,33 @@ the aprons' slate. No geometry changes and nothing is deleted: a place whose saf
 fallback floor is removed is a place where a hole in someone else's region becomes a
 fall out of the world.
 ]]
+--[[
+The torii nameplates.
+
+`SanctuaryHub.Torii_*` each carry a hand-authored `RegionLabel` BillboardGui -
+320x74 pixels of it, with a 220-stud MaxDistance, hanging at y = 35 above the
+gate. From the spawn hill that reads as four slabs of text floating in the sky
+*in front of the very landmarks they name*, which is the opposite of what a
+sign is for.
+
+Shrunk and pulled in rather than deleted: at 200x46 with a 45-stud MaxDistance
+a label is readable when you are standing under its own gate - where it is
+actually useful - and absent everywhere else, so the horizon belongs to the
+torii and the four regions behind them again. Idempotent: a re-run writes the
+same numbers it already wrote.
+]]
+local function tidyToriiLabels(hub: Instance): number
+	local shrunk = 0
+	for _, descendant in ipairs(hub:GetDescendants()) do
+		if descendant:IsA("BillboardGui") and descendant.Name == "RegionLabel" then
+			descendant.Size = UDim2.fromOffset(200, 46)
+			descendant.MaxDistance = 45
+			shrunk += 1
+		end
+	end
+	return shrunk
+end
+
 local function build()
 	local hub = Workspace:WaitForChild("SanctuaryHub")
 
@@ -2859,6 +2886,13 @@ local function build()
 		baseplate.Color = Color3.fromRGB(58, 55, 51)
 		baseplate.Material = Enum.Material.Slate
 	end
+
+	-- Skyline first: the nameplates are hand-authored under the hub rather than
+	-- built here, so this is the one pass that owns them.
+	print(string.format(
+		"[WORLD] Torii nameplates tidied: %d label(s) shrunk to 200x46 px at 45 studs.",
+		tidyToriiLabels(hub)
+	))
 
 	local rng = Random.new(SEED)
 	local totalParts = 0

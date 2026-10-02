@@ -1,47 +1,51 @@
 # RONIN: ACTIVE CONTEXT RELAY
-*Last Updated: End of Day 12 (Cinematic Future lighting + the four Horizon POIs)*
+*Last Updated: End of Day 16 (Day 11 brief re-audited; Day 15's procedural rig purged; verified stock AnimationTracks)*
 
 ## 1. Project Phase
-- Completed: Days 1-11. **Day 12: THE HORIZON - cinematic golden hour + the four regions behind the four torii.**
-- Next Up: Day 13 - `Executing` / Deathblow cinematically (carried; still the top gap).
+- Completed: Days 1-15. **Day 16: the Commander animates like a person.**
+- Next Up: Day 17 - `Executing` / Deathblow cinematically (still the top gap).
+
+## 1a. Day 11 Brief Re-Audit
+The Day 11 brief (chase AI, skeletal animation, Flaming Blade Wave, 5-move pattern,
+Boss HUD zone trigger) was re-checked against the live tree rather than rebuilt.
+**All five were already implemented and verified in Day 16.** Nothing was rewritten.
+| Requirement | Where it lives |
+| --- | --- |
+| Active chase AI | `Boss1Controller.chaseTick` (2470) - `Humanoid:MoveTo` past `COMBAT_DISTANCE` 10 at `CHASE_SPEED` 16 |
+| Skeletal animation | `BossAnimate.luau` - engine `Animator`, 9 stock tracks, zero `C0`/`C1`/`Transform` writes |
+| Flaming Blade Wave | `buildBladeWave` (1244) / `throwBladeWave` (1528) / `updateWaves` (1462) |
+| 5-move pattern | `BossConfig.MOVES` (530) - Flurry, Cleave, Thrust, Sweep, Retreat, plus `Ranged` > 18 studs |
+| Boss HUD zone gate | `BossHUD.insideArena` (596) - `GetPartsInPart` against `Arena1Zone`, 0.2s poll |
+
+**Lesson: the brief was stale, not the code.** Check `git status` and the working
+tree before treating a day brief as unimplemented - Days 12-16 were sitting uncommitted.
 
 ## 2. Live System Registry
-- `src/server/ServerScriptService/WorldEnvironment.server.luau` (**new**, ~2.9k lines) - owns `Lighting` and builds `SanctuaryHub.Horizon`: **1507 parts, 4 regions, 4 zone anchors.** S1 skeleton+palette, S2 shared kit, S3 golden hour, S4-S7 regions, S8 boot. Idempotent (destroys and rebuilds `Horizon`).
-- `SanctuaryHub.Horizon.{North_BurningAshFortress | East_WhisperingBambooGrove | West_SunkenPagoda | South_CrimsonEclipseCitadel}` (**new**) - `RoninRegion`, `RoninRegionDirection`, `RoninRegionParts`, `RoninRegionReady`; the parent carries `RoninHorizonReady` (written last), `RoninHorizonParts`, `RoninHorizonZones`.
-- Zone anchors (**new**): `Arena1Zone` (90x40x90 over the courtyard), `BambooGroveZone`, `SunkenPagodaZone`, `CrimsonCitadelZone`; each with `RoninZone` / `RoninZoneIndex` / `RoninZoneDirection`.
-- Lighting owners (**new**): `WORLD_Atmosphere`, `WORLD_Bloom`, `WORLD_SunRays`, `WORLD_Grade`. `ARENA_Burn_Grade` deliberately untouched.
-- Unchanged: every Days 1-11 file, the hub geometry, the arena, the boss.
+- `BossAnimate.luau` (**new**, ReplicatedStorage, 512 lines) - replaces the deleted `BossRigPose.luau`. Owns the Commander's animation entirely through the engine: creates the `Animator`, loads 9 verified Roblox stock tracks, owns the blade `Trail` + `StrikeFlash`. Exports `attach/play/settle/freeze/update`. **Writes no `C0`/`C1`/`Transform` at all.**
+- `BossRigPose.luau` - **DELETED**. 1104 lines of joint math, gone. `BossAnimation.luau` and `KeyframeSequenceProvider` remain gone.
+- `Boss1Controller.server.luau` - requires `BossAnimate`; `playAttack/settleToGuard/freezePose` remain but now drive real tracks. `readyBlade`/`foldGuard` and `POSE_*` are **deleted** - there is no stance to hold any more. `MOVE_CLIPS` maps 4 moves onto 3 real clips; `DragonCleave` plays `Sweep` at `CLEAVE_SPEED` 0.62. `Ranged` casts with `Lunge` at 0.85x. `bossHeartbeat` calls `BossAnimate.update(rig, os.clock())`.
+- `AvatarAssetGuard.server.luau`, `BossConfig.luau`, `BossHUD`, `Arena1Builder`, `HitValidator`, `SparringDummy` - untouched.
 
-## 3. Active Invariants (new this part)
-1. **Lighting quality is place-level, not script-level.** `Lighting.Technology` is `ReadOnly`/`RobloxScript`; `LightingStyle` + `PrioritizeLightingQuality` are `PluginOrOpenCloud`. A server script can write *neither*, so the place is authored `Realistic` + `true` and the script `pcall`s all three, warns once, and carries on. Sharing one `pcall` between `Technology` and `LightingStyle` killed the entire first boot.
-2. **Exactly one `Atmosphere` / `Bloom` / `SunRays`.** `adopt` takes the existing instance and renames it; leftovers are destroyed. `ColorCorrectionEffect` is **never** pruned: multiple compose by design, and that is how `ARENA_Burn_Grade` tints the fight.
-3. **Scenery is `CanQuery = false`.** `BladeHitbox` resolves the *first* thing four swept rays hit, so a queryable bamboo stalk between blade and target eats the hit silently.
-4. **`Arena1Zone` must stay *larger* than the room it covers** (90 > 86 outer). A ray with both ends inside a box never crosses its surface, so the invisible anchor cannot swallow a swing or a line-of-sight check. Shrinking it below the courtyard would break the boss fight.
-5. **A cylinder's axis is its local X.** `Vector3.new(h, d, d)` plus a quarter turn about Z is a standing stalk; `Vector3.new(d, h, d)` is a pancake. `makeCylinder` owns this, and every stalk in the file goes through it.
-6. **No per-frame loop exists in `WorldEnvironment`.** Bob, sway and flicker are `TweenInfo` with `RepeatCount = -1`; bobbing instances replicate a CFrame per frame, so only 8 of the 16 water lanterns move.
-7. **Nothing moves that could drop a player off the arena wall.** The north flights stop at y = 64 and never touch the courtyard; the only walkable route out of any region is the south citadel's staircase.
-8. **`Baseplate` is restyled, never deleted** (colour + material only). It is the fallback floor for the whole place.
+## 3. Active Invariants
+1. **The boss writes no joint transform, ever.** The only `C0`/`C1` writes left in the whole boss path are one-time setup inside `normalizeJoints` and the katana grip, before the rig enters the world. The glide is gone because there is no second writer.
+2. **Only 11 animation ids in the entire experience are permission-free, and they are all Roblox's stock set.** Measured by loading **200,002** candidate ids onto a live R15 rig at runtime; the other 200k printed `The experience doesn't have access permission to use asset id ...` and returned zero-length tracks. Never hardcode a community animation id here - the ids in `BossAnimate.TRACK_IDS` were **harvested from the live avatar's stock `Animate` script**, which is the only permanently-safe source.
+3. **`Priority` and `Looped` are set at `Play` time, never at load time.** `Animation` data resolves asynchronously and **resets both to defaults when it lands**. Measured: set `Action4` at attach, read back `Action` one second later. All playback routes through `playTracked` for this reason. `Looped` matters most - `Sweep` left `true` would never end its swing.
+4. **The brief's two combat ids were correct and the third was not.** `522635514` is Roblox's `ToolSlashAnim` and `522638767` is `ToolLungeAnim`. **No permission-free overhead track exists**, so `DragonCleave` uses the largest available swing (`507767714`, both arms, 2.5 studs) slowed to 0.62x.
+5. **`522638767` (ToolLunge) barely moves on its own** - peak right-shoulder is only 12deg and the hand travels 0.1 studs. It reads as a *thrust pose*, which is why it serves `PerilousThrust` and the wave cast, not as a general attack.
+6. **`AnimationTrack` methods need `:`.** `track.AdjustSpeed(x)` throws `Expected ':' not '.'` - `tools/Check-Luau.ps1` is a **syntax** check only and will PASS that bug. It caught neither this nor the `#TRACK_IDS == 0` count bug; only the playtest did.
+7. **The `HitValidator` line-608 "false positive" was a real bug, and it is fixed.** Two prior passes wrote it off as a checker limitation. It was an orphaned `--[[` whose body was empty, immediately followed by the `breakGuard` docstring's own `--[[`. Luau long comments **do not nest**, so the first `--[[` swallowed the second opener and every line up to the *real* closer at 634 - turning a 26-line docstring into one 40-line comment. It parsed, so only a text-level checker could see it. Now deleted: **all 33 files PASS**. Do not dismiss checker output as a known false positive without reading the flagged lines.
 
-## 4. Engine Changes That Constrain Working Code (Sept 2026 build)
-- **`Lighting.Technology` is `ReadOnly` (`RobloxScript`)** and the docs say it is superseded by `Lighting.LightingStyle` ("Realistic - the most advanced and realistic lighting and shadows Roblox can deliver") plus `PrioritizeLightingQuality`. The brief's "Technology = Future" is unreachable from a script; its equivalent is authored in the place.
-- **`Lighting.LightingStyle` / `PrioritizeLightingQuality` are `PluginOrOpenCloud`** - command bar and plugin yes, **server script no** ("cannot write 'LightingStyle'"). This is what stopped the first boot of the day.
-- **`Enum.Material.Water` is documented "Applies to Terrain only"**, and terrain water is locked to y = 0 - exactly this place's `Baseplate` top face. The flooded courtyard is therefore a part with `Reflectance`.
-- **`Atmosphere.Decay` renders only when `Haze` *and* `Glare` are both above 0**, so the brief's `Decay` needed a `Glare` of 0.35 to exist at all.
-- Carried from Sept 2026: `Motor6D.Priority` removed; `Enum.FloorMaterial` removed; `GuiObject.GroupTransparency` removed (`CombatDebugUI` still broken by it); `TextLabel.Transparency` is not an alias of `TextTransparency`; Instance attributes read back as `InstanceHandle`.
-- *Editor notes: `execute_luau` rejects some multi-line table literals and inline `if` expressions - keep MCP probes simple. CRLF files need UTF-8-no-BOM writes.*
+## 4. Verification Results (Day 16, live)
+- **Boot is clean**: `[BOSS ANIMATE] 9/9 verified stock tracks loaded.` Zero errors, zero permission warnings.
+- **It walks.** Measured on the client mid-fight: **path length 11.3 studs, peak 11.8 studs/s, foot vertical swing 2.24 studs.** Foot lift is the proof - the old procedural rig reported 0.07. Server-side walk showed 1.21 studs of foot swing, run 6.09.
+- **Attacks run at Action4 and move the blade.** All three (`Slash` 12.41, `Lunge` 2.31, `Sweep` 2.34 studs of hand travel) confirmed `Priority == Action4` while playing and all ended naturally (not looping).
+- **Full 5-move cycle intact**: blade waves thrown at 11-41 studs, shadow lunges, retreats, thrusts piercing guard, sweeps landing for 35 HP.
+- **Structurally clean**: `tools/Check-Luau.ps1` PASSes on all **33/33** files. The `HitValidator` line-608 failure reported in earlier passes was **real, not a false positive** - see below.
 
-## 5. Verification Results (Day 12, live)
-- **Boot**: `[WORLD] Horizon built: 1507 parts across 4 regions, 4 zone anchors` - North 278 / East 616 / West 284 / South 329. Zero errors from the new script, and the arena, its six braziers and the boss still build alongside it.
-- **Spec values, read back off the live `Lighting`**: Atmosphere `Density 0.35 / Offset 0.25 / Haze 1.5 / Glare 0.35 / Color (190,160,140) / Decay (106,112,125)`; Bloom `0.6 / 24 / 0.8`; SunRays `0.08 / 0.2`; Grade `Contrast 0.15 / Saturation 0.12 / Tint (255,245,235)`; `ClockTime 17.5`, `ExposureCompensation 0.25`, `GeographicLatitude 45`.
-- **Legacy cleanup**: `SANCTUARY_Atmosphere` + `SANCTUARY_Bloom` destroyed from the place, `SANCTUARY_Grade` renamed `WORLD_Grade`, `ARENA_Burn_Grade` left alive and still driving the boss grade.
-- **Panorama proven by raycast, not by eye** - from the spawn eye `(0, 6, 0)`, the north pagoda spire (y 158), the east hill bamboo (y 107), the west pagoda spire (y 80) and the south keep spire (y 166) are each reached by *their own* geometry first, i.e. nothing else is in the way. Only the citadel's gate (y 74) is hidden behind the south torii, by design: the climb is a route, not a billboard.
-- **Ground**: 60+ downward raycasts across all four regions - **0 holes**. This caught a real bug: `WEST_APRON_FAR - WEST_BASIN_FAR` is **negative** (every west coordinate is negative and the far bank is the *more* negative one), so the far bank silently clamped to a 0.05-stud sliver and 54 studs of shore fell back to the bare `Baseplate`.
-- **Combat unaffected**: the zone anchor swallowed **0 of 4** intra-arena blade and line-of-sight rays.
-- **Region heights** (why the panorama works at all): north 158, east 107, west 80, south 166 - every skyline clears the 26-stud torii, and the north clears the arena's 27-stud wall.
-
-## 6. Known Gaps - Next Task (Day 13)
-- **No `Executing` / Deathblow.** `Vulnerable` opens the window and `BrokenHealthMultiplier` (1.6) is read, but nothing plays a finisher. Still the top gap.
-- **`CombatDebugUI` uses the removed `GroupTransparency`** - its fade and vignette are dead on this engine. Same fix as `BossHUD` (S4).
-- The other three regions are built but **not yet encounters** - only the north has a fight. Each needs its own `BossConfig` entry, controller and gate before a player is sent through it.
-- **`Lighting`'s effects are adopted at boot rather than present under their world names** (`Atmosphere`, `Bloom`, `SunRays` keep their old names on disk and are renamed in the runtime DataModel). Harmless, but the Explorer and the running game disagree until the first boot.
-- Carried from Day 11: a deflect plays two sounds (`DeflectFeedback.Clang` plus the palette cue); `WeaponVisuals` pose tweens are not registered with `Hitstop`; the lean is client-local; `CameraShaker` has no HUD row; `SanctuaryHub.CourtyardFloor` is 1x104x104 rotated Z=90 (reads as a wall in the Explorer; worth renaming).
+## 5. Known Gaps - Next Task (Day 17)
+- **No `Executing` / Deathblow.** `Vulnerable` opens the window and `BrokenHealthMultiplier` is read, but nothing plays a finisher. Still the top gap.
+- **No distinct overhead clip** - `DragonCleave` is a slowed `Sweep` (see invariant 4). A real one needs an owned asset.
+- **`Check-Luau.ps1` cannot catch type errors.** It is syntax-only. The two worst bugs this pass were both type-level. Consider adding a strict-analysis pass. Note it *did* catch the nested-comment bug above, so run it and read its output.
+- `CombatDebugUI` uses the removed `GroupTransparency`. The other three regions are built but **not yet encounters**.
+- Carried from Day 11: a deflect plays two sounds; `WeaponVisuals` pose tweens are not registered with `Hitstop`; `CameraShaker` has no HUD row; `SanctuaryHub.CourtyardFloor` reads as a wall in the Explorer.
+- **Closed this pass**: the "no leg cycle" gap from Day 15 is gone - the `Animator` supplies it.

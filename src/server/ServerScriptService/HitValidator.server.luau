@@ -606,8 +606,6 @@ local function closeParryWindow(character: Model)
 end
 
 --[[
-
---[[
 	Forces a defender's guard down and their body into `Stunned`.
 
 	Two things happen here, in this order, and the order matters:

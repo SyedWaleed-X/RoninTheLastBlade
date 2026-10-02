@@ -11,7 +11,11 @@
 	The HUD needs four live values - Health, max Health, Posture, max Posture - plus
 	Phase. All six are attributes on the boss Model, and attributes replicate. So the
 	HUD reads them directly and receives *exactly one* message from the server: the
-	engage event, whose whole job is to say when to fade in and what the ceilings are.
+	engage event, whose whole job is to say what the ceilings are and when the fight
+	is live. *Where* the HUD may be visible at all is asked on this side of the wire,
+	by the arena-zone gate at the bottom of the file - a client that could see the
+	boss bar from the spawn hill would be showing a fight to a player who is not in
+	the arena.
 
 	That is not a shortcut, it is the design. A per-frame remote would put the boss's
 	health bar on the network whether or not anyone was looking at it, and would make
@@ -115,6 +119,20 @@ local gui = make("ScreenGui", playerGui, {
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
 local screenGui = gui :: ScreenGui
+
+--[[
+	Hard off at boot - and the reason is worth writing down, because the fade
+	system below cannot express it.
+
+	`setVisible` only ever returns the frame to the transparency it was authored
+	at. A HUD that is built at its authored transparency is therefore *visible*
+	from the first frame, and "hidden until the player is in the arena" is not a
+	fade - it is a state. So the ScreenGui itself starts `Enabled = false`, and
+	the only thing in this file that switches it on is the arena-zone gate at the
+	bottom: at the SanctuaryHub spawn the boss frame does not exist as far as the
+	player is concerned.
+]]
+screenGui.Enabled = false
 
 local root = make("Frame", screenGui, {
 	Name = "Root",
@@ -274,9 +292,9 @@ end
 --[[
 	Find the boss through the arena folder rather than by searching all of Workspace.
 
-	The path is the same documented one `Arena1Builder` publishes and `Boss1Controller`
-	waits on, so all three agree by construction instead of by a search that would also
-	match a boss in some future region.
+	The path is the same documented one `Boss1Controller` builds the Commander
+	into at boot, so both sides agree by construction instead of by a search that
+	would also match a boss in some future region.
 ]]
 local function findBoss(): Model?
 	local hub = workspace:FindFirstChild("SanctuaryHub")
@@ -289,8 +307,8 @@ local function findBoss(): Model?
 	end
 		-- By name, not by attribute: an Instance-valued attribute reads back as an
 		-- `InstanceHandle`, which cannot even answer `IsA`. The name is the one
-		-- `Arena1Builder` publishes and `Boss1Controller` waits on.
-		local boss = arena:FindFirstChild("TheCorruptedCommander")
+		-- `Boss1Controller` builds the Commander under at boot.
+		local boss = arena:FindFirstChild("CorruptedCommander")
 		if boss == nil or not boss:IsA("Model") then
 			return nil
 		end
@@ -374,6 +392,13 @@ local function setVisible(on: boolean)
 	fading = true
 	visible = on
 
+	-- The ScreenGui is the hard gate: switched on *before* the fade-in starts,
+	-- so a frame that is fading in is never fading in behind a disabled parent
+	-- (which would make the fade invisible and the HUD pop at the end of it).
+	if on then
+		screenGui.Enabled = true
+	end
+
 	for _, tween in ipairs(fadeTweens) do
 		tween:Cancel()
 	end
@@ -412,6 +437,12 @@ local function setVisible(on: boolean)
 	if #fadeTweens > 0 then
 		fadeTweens[1].Completed:Once(function()
 			fading = false
+			-- Off again only once the fade-out has actually landed. Disabling on
+			-- the first frame instead would cut the fade short and read as a
+			-- blink rather than as the frame leaving.
+			if not visible then
+				screenGui.Enabled = false
+			end
 		end)
 	end
 end
@@ -448,10 +479,13 @@ if remote ~= nil and remote:IsA("RemoteEvent") then
 			healthTarget = 1
 			shownPhase = 0
 			setPips(1)
-			setVisible(true)
 	else
-			bossModel = nil
-			setVisible(false)
+			-- Visibility is deliberately *not* written here. The arena-zone gate
+			-- owns it, so a disengage that fires while the player is still
+			-- standing in the courtyard cannot yank the frame away mid-fade, and
+			-- an engage that fires before the player has walked in cannot show it
+			-- to somebody who is not there.
+			bossModel = findBoss()
 	end
 	end)
 end
@@ -517,6 +551,87 @@ local function onRenderStep()
 		nameText.TextStrokeTransparency = 0.55
 	end
 end
+
+--[[
+	The arena-zone gate.
+
+	The engage event says *a* fight has started; this says whether *this* player
+	is standing inside the arena it started in. Those are different questions,
+	and only the second one is allowed to make the HUD visible: at the
+	SanctuaryHub spawn the boss frame has to be 100% absent, and no distance
+	check can promise that because spawn sits inside line of sight of the
+	courtyard.
+
+	`workspace:GetPartsInPart` with an `Include` filter of the local character is
+	the spatial-query form of "is my character inside `Arena1Zone`": the answer
+	comes from geometry rather than from coordinates, so the world builder can
+	move or resize the anchor without this file knowing. The anchor itself is
+	the invisible 90x40x90 volume `WorldEnvironment` publishes over the
+	courtyard, deliberately `CanQuery = true` for exactly this kind of question.
+
+	The loop is a 0.2s `task.wait`, not a per-frame callback: it owns a *fade*,
+	not an interpolation, and the fade already has its own clock inside
+	`TweenService`. Everything it writes happens on the transition, so a steady
+	state costs one boolean comparison per tick.
+]]
+local zoneOverlap = OverlapParams.new()
+zoneOverlap.FilterType = Enum.RaycastFilterType.Include
+zoneOverlap.FilterDescendantsInstances = {}
+
+local arenaZone: BasePart? = nil
+local zoneCharacter: Model? = nil
+
+local function resolveZone(): BasePart?
+	local hub = workspace:FindFirstChild("SanctuaryHub")
+	if hub == nil then
+		return nil
+	end
+	local zone = hub:FindFirstChild("Arena1Zone", true)
+	if zone ~= nil and zone:IsA("BasePart") then
+		return zone :: BasePart
+	end
+	return nil
+end
+
+local function insideArena(): boolean
+	local character = player.Character
+	if character == nil then
+		return false
+	end
+	-- The Include filter is rebuilt only when the character reference changes,
+	-- so the steady-state poll allocates nothing.
+	if zoneCharacter ~= character then
+		zoneCharacter = character
+		zoneOverlap.FilterDescendantsInstances = { character }
+	end
+	local zone = arenaZone
+	if zone == nil then
+		zone = resolveZone()
+		arenaZone = zone
+		if zone == nil then
+			return false
+		end
+	end
+	return #workspace:GetPartsInPart(zone, zoneOverlap) > 0
+end
+
+local wasInside = false
+task.spawn(function()
+	while true do
+		local inside = insideArena()
+		if inside ~= wasInside then
+			wasInside = inside
+			if inside then
+				bossModel = findBoss()
+				healthTarget = 1
+				shownPhase = 0
+				setPips(1)
+			end
+			setVisible(inside)
+		end
+		task.wait(0.2)
+	end
+end)
 
 RunService.RenderStepped:Connect(onRenderStep)
 

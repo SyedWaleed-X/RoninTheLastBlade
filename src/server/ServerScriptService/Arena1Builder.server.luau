@@ -4,15 +4,17 @@
 Arena1Builder
 Ronin - The Last Blade . Realm 1: The Burning Ash Courtyard
 
-Constructs the courtyard, the perimeter, the braziers, the ash and the gate, and
-clones the Commander into the middle of it.
+Constructs the courtyard, its dedicated 80x80 dueling floor, the perimeter, the
+braziers, the ash and the gate. The Commander itself is not built here any more:
+`Boss1Controller` clones `Workspace.Rig` and stands it on the floor this file
+lays.
 
 Why a builder rather than hand-placed instances
 ------------------------------------------------
 Everything here is a *function* of `ARENA_HALF_EXTENT`. Change the arena from
 80x80 to 100x100 and the floor, all four walls, both wall segments either side of
 	the gate, the gate frame, the six brazier positions, the ash volume and the
-boss's spawn all move together, correctly, from one number. A hand-placed arena
+Commander's floor all move together, correctly, from one number. A hand-placed arena
 is sixty instances that silently disagree with each other the first time anyone
 resizes it.
 
@@ -239,296 +241,15 @@ local function makeFlame(fire: BasePart): ParticleEmitter
 end
 
 --[[
-One brazier: the Creator Store iron bowl, plus the fire and the light that make
-it a fire.
+The brazier's identity and palette.
 
-The asset supplies the *shape* only. Its stock light is retuned rather than
-deleted (so the asset stays as authored) and the flame is authored here for one
-reason: the asset ships no fire at all, and a brazier without fire is a planter.
-
-A clone arrives at the *template's* pivot, so it cannot simply be placed at a
-fixed height: only its own bounding box knows where its base is. Park it well
-clear, measure the lowest point, then translate by the exact difference between
-	that point and the arena floor.
+`COLOR_ARMOR` / `COLOR_TRIM` / `COLOR_CLOTH` / `COLOR_SKIN` used to be declared
+here as well: they belonged to the blocky, welded Commander this file no longer
+builds. The Commander is a real R15 rig cloned from `Workspace.Rig` by
+`Boss1Controller` now, so its colours live next to its logic.
 ]]
---[[
-The native templates.
-
-Two models, built out of nothing but native engine instances, used whenever
-`ReplicatedStorage.BossTemplates` does not already hold an authored one.
-
-Why they exist at all, since the brief asks for a template:
-
-The safety invariant for this project forbids importing community Tool/Model
-packages, and a Creator Store character rig is exactly that - a Model whose
-provenance nobody in this repository can audit, whose scripts have to be
-stripped on arrival, and whose Motor6D naming is a property of the asset rather
-than of this code. Building the rig here means the joint names the pose table
-depends on are guaranteed by the file that reads them, there is no third-party
-script surface to sanitise, and the arena is reproducible from a clean clone of
-the place with no asset dependency at all.
-
-It is a *fallback*, not a replacement: an authored `BossTemplates.CorruptedCommander`
-still wins, so a designer can art-direct the Commander later without touching a
-line of this file. `FindFirstChild` with no wait is what makes the difference -
-`WaitForChild` with no timeout on a missing folder waits forever and takes the
-whole arena down with it, which is exactly the failure the first live test
-produced.
-]]
-local TEMPLATE_FOLDER = "BossTemplates"
-local COMMANDER_NAME = "CorruptedCommander"
 local BRAZIER_NAME = "IronBrazier"
-
-local COLOR_ARMOR = Color3.fromRGB(38, 36, 40)
-local COLOR_TRIM = Color3.fromRGB(92, 22, 24)
-local COLOR_CLOTH = Color3.fromRGB(26, 24, 28)
-local COLOR_SKIN = Color3.fromRGB(150, 132, 118)
 local COLOR_IRON = Color3.fromRGB(58, 54, 52)
-
---[[
-An authored template if one is present, otherwise the native build.
-
-The lack of a wait is the point. A missing template must produce a *repaired*
-arena, and the only way to get that is to stop waiting for something that is not
-coming.
-]]
-local function resolveTemplate(name: string, build: () -> Model): Model
-	local folder = ReplicatedStorage:FindFirstChild(TEMPLATE_FOLDER)
-	if folder ~= nil then
-		local authored = folder:FindFirstChild(name)
-		if authored ~= nil and authored:IsA("Model") then
-			return authored
-		end
-	end
-	print(string.format("[ARENA 1] No authored %s template - building the native one.", name))
-	return build()
-end
-
---[[
-The Commander, as a clean R15 rig.
-
-Standard R15 proportions with `HumanoidRootPart` at the origin and the feet at
-y = -5, which is the layout `Humanoid.HipHeight = 2` expects.
-
-The Motor6D `C0` values are *derived* from the authored world CFrames rather than
-typed in, and that is the whole trick to building a rig from script: setting
-`C0 = p0.CFrame:ToObjectSpace(p1.CFrame)` with an identity `Transform` makes each
-joint hold the pose its parts were placed in, so the rig stands up with no
-`Animate` LocalScript and no guessed C0 values to correct later. `Animate` is
-stripped deliberately - it writes every joint at the default priority on the next
-frame and would overwrite the telegraph poses.
-
-The joint names are load-bearing. The pose table addresses the Commander by
-`RightShoulder` / `LeftElbow` and so on, while stock R15 spacing is "Right
-Shoulder", so the spaces are stripped as the joints are created.
-]]
-local function buildCommander(): Model
-	local boss = Instance.new("Model")
-	boss.Name = COMMANDER_NAME
-
-	local rig = Instance.new("Model")
-	rig.Name = "Rig"
-	rig.Parent = boss
-
-	local function piece(name: string, size: Vector3, cf: CFrame, color: Color3, material: Enum.Material?): Part
-		local p = Instance.new("Part")
-		p.Name = name
-		p.Size = size
-		p.CFrame = cf
-		p.Color = color
-		p.Material = if material ~= nil then material else Enum.Material.SmoothPlastic
-		p.Anchored = false
-		--[[
-		Collision and query flags, and the split between them is load-bearing.
-
-		`CanCollide = false` on every limb: a Commander whose arms and pauldrons are
-		solid catches on the gate frame and the bamboo and shoves the player around
-		the courtyard, which reads as the arena being broken rather than the boss
-		being heavy.
-
-		`CanQuery = true`, though, and that is not a default to be left alone. CanQuery
-		is what makes a part visible to *spatial queries*, and the player's katana
-		finds its targets with one. With `CanQuery = false` on every boss part the
-		Commander was completely invulnerable: the blade swept straight through it,
-		`[HIT DETECTED]` never printed, and the fight ran with the boss pinned at a
-		permanent 400 Health. An invisible, unhittable boss is a far worse bug than
-		one that is slightly easier to hit, so queryability wins over tidiness.
-
-		`CanTouch = false` is safe to keep: nothing in this project resolves a strike
-		through touch events, and the boss picks its own targets by distance.
-		]]
-		p.CanCollide = false
-		p.CanTouch = false
-		p.CanQuery = true
-		p.CastShadow = true
-		p.TopSurface = Enum.SurfaceType.Smooth
-		p.BottomSurface = Enum.SurfaceType.Smooth
-		p.Parent = rig
-		return p
-	end
-
-	local rootPart = piece("HumanoidRootPart", Vector3.new(2, 2, 1), CFrame.new(0, 0, 0), COLOR_ARMOR)
-	rootPart.Transparency = 1
-	rootPart.CanCollide = true
-	rig.PrimaryPart = rootPart
-
-	local lowerTorso = piece("LowerTorso", Vector3.new(2, 2, 1), CFrame.new(0, -1, 0), COLOR_CLOTH)
-	local upperTorso = piece("UpperTorso", Vector3.new(2, 2, 1), CFrame.new(0, 1, 0), COLOR_ARMOR)
-	local head = piece("Head", Vector3.new(1, 1, 1), CFrame.new(0, 2.5, 0), COLOR_SKIN)
-
-	local rUpperArm = piece("RightUpperArm", Vector3.new(1, 2, 1), CFrame.new(1.5, 1, 0), COLOR_ARMOR)
-	local rLowerArm = piece("RightLowerArm", Vector3.new(1, 2, 1), CFrame.new(1.5, -0.5, 0), COLOR_ARMOR)
-	local rHand = piece("RightHand", Vector3.new(1, 1, 1), CFrame.new(1.5, -2, 0), COLOR_TRIM)
-	local lUpperArm = piece("LeftUpperArm", Vector3.new(1, 2, 1), CFrame.new(-1.5, 1, 0), COLOR_ARMOR)
-	local lLowerArm = piece("LeftLowerArm", Vector3.new(1, 2, 1), CFrame.new(-1.5, -0.5, 0), COLOR_ARMOR)
-	local lHand = piece("LeftHand", Vector3.new(1, 1, 1), CFrame.new(-1.5, -2, 0), COLOR_TRIM)
-
-	local rUpperLeg = piece("RightUpperLeg", Vector3.new(1, 2, 1), CFrame.new(0.5, -2, 0), COLOR_CLOTH)
-	local rLowerLeg = piece("RightLowerLeg", Vector3.new(1, 2, 1), CFrame.new(0.5, -3.5, 0), COLOR_CLOTH)
-	local rFoot = piece("RightFoot", Vector3.new(1, 1, 1), CFrame.new(0.5, -5, 0), COLOR_ARMOR)
-	local lUpperLeg = piece("LeftUpperLeg", Vector3.new(1, 2, 1), CFrame.new(-0.5, -2, 0), COLOR_CLOTH)
-	local lLowerLeg = piece("LeftLowerLeg", Vector3.new(1, 2, 1), CFrame.new(-0.5, -3.5, 0), COLOR_CLOTH)
-	local lFoot = piece("LeftFoot", Vector3.new(1, 1, 1), CFrame.new(-0.5, -5, 0), COLOR_ARMOR)
-	-- Pauldrons and a crest: welded decoration, so the silhouette reads as
-	-- armour across a dark arena and cannot lag behind a telegraph pose.
-	local function weldTo(anchor: BasePart, p: BasePart)
-		local weld = Instance.new("WeldConstraint")
-		weld.Part0 = anchor
-		weld.Part1 = p
-		weld.Parent = p
-	end
-	for _, arm in ipairs({ rUpperArm, lUpperArm }) do
-		weldTo(arm, piece(arm.Name .. "Pauldron", Vector3.new(1.3, 0.7, 1.3),
-			arm.CFrame + Vector3.new(0, 0.8, 0), COLOR_TRIM, Enum.Material.Metal))
-	end
-	weldTo(head, piece("Crest", Vector3.new(0.16, 0.9, 0.7),
-		head.CFrame + Vector3.new(0, 0.75, 0), COLOR_TRIM, Enum.Material.Metal))
-
-	local function joint(name: string, p0: BasePart, p1: BasePart)
-		local m = Instance.new("Motor6D")
-		m.Name = (name:gsub(" ", ""))
-		m.Part0 = p0
-		m.Part1 = p1
-		m.C0 = p0.CFrame:ToObjectSpace(p1.CFrame)
-		m.C1 = CFrame.new()
-		m.Transform = CFrame.new()
-		m.Parent = p0
-	end
-
-	joint("Root", lowerTorso, rootPart)
-	joint("Waist", upperTorso, lowerTorso)
-	joint("Neck", upperTorso, head)
-	joint("Right Shoulder", upperTorso, rUpperArm)
-	joint("Left Shoulder", upperTorso, lUpperArm)
-	joint("Right Elbow", rUpperArm, rLowerArm)
-	joint("Left Elbow", lUpperArm, lLowerArm)
-	joint("Right Wrist", rLowerArm, rHand)
-	joint("Left Wrist", lLowerArm, lHand)
-	joint("Right Hip", lowerTorso, rUpperLeg)
-	joint("Left Hip", lowerTorso, lUpperLeg)
-	joint("Right Knee", rUpperLeg, rLowerLeg)
-	joint("Left Knee", lUpperLeg, lLowerLeg)
-	joint("Right Ankle", rLowerLeg, rFoot)
-	joint("Left Ankle", lLowerLeg, lFoot)
-
-	local humanoid = Instance.new("Humanoid")
-	humanoid.Name = "Humanoid"
-	humanoid.RigType = Enum.HumanoidRigType.R15
-	humanoid.HipHeight = 2
-	humanoid.BreakJointsOnDeath = false
-	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-	humanoid.Health = BossConfig.MaxHealth
-	humanoid.MaxHealth = BossConfig.MaxHealth
-	humanoid.WalkSpeed = 14
-	--[[
-	AutoRotate stays ON. `Boss1Controller` faces the player exclusively through
-	`Humanoid:Move`, and that call only turns a character when `AutoRotate` is
-	enabled. With it off the Commander slides past the player without ever facing
-	them, and since `fireSwing` tests a forward cone rather than a radius, every
-	one of its five moves silently whiffs - a fight that looks like it is running
-	and is not landing a single hit.
-	]]
-	humanoid.AutoRotate = true
-	humanoid.Parent = rig
-	--[[
-	The telegraph hardware, parented exactly where `Boss1Controller` looks for it.
-
-	Built here rather than in the controller so that file stays a pure *reader* of
-	the boss: it performs no `Instance.new`, which means the Commander can be
-	swapped for a different rig without the fight logic being aware of it. Every
-	colour and range is read from `BossConfig`, so the telegraph palette has one
-	owner and the template cannot drift away from the balance pass.
-	]]
-	local telegraphLight = Instance.new("PointLight")
-	telegraphLight.Name = "TelegraphLight"
-	telegraphLight.Brightness = 0
-	telegraphLight.Range = BossConfig.Telegraph.Range
-	telegraphLight.Color = BossConfig.Telegraph.Amber
-	telegraphLight.Shadows = true
-	telegraphLight.Parent = rootPart
-
-	local chime = Instance.new("Sound")
-	chime.Name = "PerilChime"
-	chime.SoundId = BossConfig.Audio.PerilChime
-	chime.Volume = 1
-	chime.PlaybackSpeed = 1.35
-	chime.RollOffMode = Enum.RollOffMode.InverseTapered
-	chime.MinDistance = 7
-	chime.MaxDistance = 90
-	chime.Parent = head
-
-	local slam = Instance.new("Sound")
-	slam.Name = "CleaveSlam"
-	slam.SoundId = BossConfig.Audio.CleaveSlam
-	slam.Volume = 0.9
-	slam.RollOffMode = Enum.RollOffMode.InverseTapered
-	slam.MinDistance = 7
-	slam.MaxDistance = 90
-	slam.Parent = rootPart
-
-	local kanji = Instance.new("BillboardGui")
-	kanji.Name = "PerilKanji"
-	kanji.Size = UDim2.fromOffset(150, 150)
-	kanji.StudsOffset = Vector3.new(0, 4.2, 0)
-	kanji.MaxDistance = 90
-	kanji.AlwaysOnTop = true
-	kanji.LightInfluence = 0
-	kanji.Enabled = false
-	kanji.Adornee = head
-	kanji.Parent = head
-
-	local stroke = Instance.new("Frame")
-	stroke.Name = "Stroke"
-	stroke.Size = UDim2.fromScale(1, 1)
-	stroke.BackgroundTransparency = 1
-	stroke.Parent = kanji
-
-	local glow = Instance.new("Frame")
-	glow.Name = "Glow"
-	glow.Size = UDim2.fromOffset(150, 150)
-	glow.Position = UDim2.fromOffset(-25, -25)
-	glow.BackgroundColor3 = BossConfig.Telegraph.Red
-	glow.BackgroundTransparency = 0.75
-	glow.BorderSizePixel = 0
-	glow.Rotation = 45
-	glow.Parent = stroke
-
-	local glyph = Instance.new("TextLabel")
-	glyph.Name = "Glyph"
-	glyph.Size = UDim2.fromScale(1, 1)
-	glyph.BackgroundTransparency = 1
-	-- The kanji for "peril", assembled from code points so this file stays pure
-	-- ASCII and cannot be corrupted by an editor that guesses at encodings.
-	glyph.Text = string.char(0x5B, 0x38)
-	glyph.Font = Enum.Font.GothamBold
-	glyph.TextSize = 96
-	glyph.TextColor3 = BossConfig.Telegraph.Red
-	glyph.TextStrokeColor3 = Color3.fromRGB(60, 0, 0)
-	glyph.TextStrokeTransparency = 0.25
-	glyph.Parent = stroke
-
-	return boss
-end
 
 --[[
 The iron brazier, as native Parts.
@@ -653,7 +374,11 @@ local function makeBamboo(parent: Instance): number
 	for i = 0, count do
 			local t = (i / count) * 2 - 1
 			local along = t * half
-			local depth = (half + 1.5) + (culms % 4) * 1.6
+			-- The jitter is indexed by `i`, not by `culms`: `culms` only counts the
+			-- stalks that were actually placed, so indexing by it made the depth
+			-- saturate at its first two values and the courtyard grew two culms
+			-- instead of a thicket.
+			local depth = (half + 1.5) + (i % 4) * 1.6
 			local x = alongX and depth * (face == 2 and 1 or -1) or along
 			local z = alongX and along or depth * (face == 1 and -1 or 1)
 			if math.abs(x) < Arena.HalfExtent - 1 and math.abs(z) < Arena.HalfExtent - 1 then
@@ -755,170 +480,6 @@ local function makeGate(parent: Instance): (BasePart, BasePart)
 	gateRight:SetAttribute("RoninGateClosedX", Arena.Center.X + Arena.GateHalfWidth * 0.5)
 
 	return gateLeft, gateRight
-end
---[[
-The Commander.
-
-Cloned from `ReplicatedStorage.BossTemplates.CorruptedCommander` rather than
-parented directly, which is what makes the fight repeatable: a defeated boss is
-destroyed and re-cloned for the next run, so the only thing that can go stale is
-	the clone, and the clone is rebuilt from the template every time.
-
-`ScaleTo` is used rather than scaling the parts by hand because the templated rig
-carries Motor6Ds and accessories; `ScaleTo` resizes the whole assembly correctly,
-where hand-scaling would leave the joints mismatched and the boss would walk with
-its knees inside its chest.
-
-The five brief-named attributes are written here, on the Model, before the boss
-is parented into the world - so a client that sees the boss at all sees it with
-its Health already 400 and its Phase already 1, and there is never a frame in
-which the HUD could read a nil.
-]]
---[[
-The nodachi.
-
-The brief names `ReplicatedStorage.KatanaModel` as the Commander's weapon and
-this is where that promise is kept. The template already carries a `KatanaB`
-accessory, and it is *removed* rather than left in place: two blades in one
-hand renders as a bug, and the accessory is a bare `Part` welded to a
-`ThumbnailConfiguration`, which is not a rig attachment at all.
-
-Why a `WeldConstraint` and not a `Motor6D`, when the player's own katana uses
-a `Motor6D` grip: the player rig needs the motor because `WeaponVisuals`
-*re-poses* the grip every frame to drive swing animation. The Commander has no
-weapon animation - its telegraph is a `Motor6D` pose on the arm joints - so a
-motor would buy a degree of freedom nothing writes to, and a constraint is one
-fewer thing that can be driven by a stray tween during a fight.
-
-The offset places the grip 1.5 studs ahead of the palm with the blade's +Y axis
-tipped to near-horizontal, which is the same rest pose `SparringDummy` uses for
-the player's grip. Shared numbers on purpose: the Commander should read as
-holding a katana the same way the player does, or the parry the player has
-learned on the dummy is being asked for against a different weapon.
-
-Failure is loud. A boss that spawns without a weapon would not throw an error -
-it would simply be a man punching, and every reach number in `BossConfig`
-would be quietly wrong. So a missing template or a missing hand is an error,
-not a warning.
-]]
-local KATANA_TEMPLATE = "KatanaModel"
-local KATANA_BLADE = "Handle"
-local BLADE_NAME = "RoninNodachi"
-local GRIP_NAME = "NodachiGrip"
-local GRIP_TRANSLATION = Vector3.new(0, 0, -1.5)
-local REST_POSE = CFrame.Angles(math.rad(-82), 0, 0)
-
-local function equipKatana(boss: Model, rig: Model)
-	local template = ReplicatedStorage:FindFirstChild(KATANA_TEMPLATE)
-	if template == nil or not template:IsA("Model") then
-		error("[Arena1Builder] ReplicatedStorage.KatanaModel was missing - the Commander cannot spawn unarmed")
-	end
-
-	local rightHand = rig:FindFirstChild("RightHand")
-	if rightHand == nil or not rightHand:IsA("BasePart") then
-		error("[Arena1Builder] CorruptedCommander.Rig had no RightHand to hold the nodachi")
-	end
-
-	-- The template's own accessory is stripped: one blade per hand.
-	local accessory = rig:FindFirstChild("KatanaB")
-	if accessory ~= nil then
-		accessory:Destroy()
-	end
-
-	local katana = template:Clone()
-	katana.Name = BLADE_NAME
-	katana.Parent = boss
-
-	local blade = katana:FindFirstChild(KATANA_BLADE)
-	if blade == nil or not blade:IsA("BasePart") then
-		error("[Arena1Builder] KatanaModel had no Handle MeshPart")
-	end
-
-	-- The blade is scaled with the body. A 4-stud nodachi on a 1.2x Commander
-	-- reads as a toy, and the reach numbers in `BossConfig` are written against
-	-- the Commander's size - so the weapon is scaled by the same factor and the
-	-- grip offset with it, rather than the blade being scaled and the hand
-	-- offset left at player dimensions.
-	katana:ScaleTo(BossConfig.Scale)
-
-	-- Position before welding. A WeldConstraint fixes the *current* relative
-	-- transform, so the offset has to be authored first or the blade snaps to
-	-- the hand's origin.
-	blade.CFrame = (rightHand :: BasePart).CFrame
-		* CFrame.new(GRIP_TRANSLATION * BossConfig.Scale)
-		* REST_POSE
-	blade.Anchored = false
-	blade.CanCollide = false
-	blade.CanTouch = false
-	blade.CanQuery = true
-	blade.Massless = true
-
-	local weld = Instance.new("WeldConstraint")
-	weld.Name = GRIP_NAME
-	weld.Part0 = rightHand
-	weld.Part1 = blade
-	weld.Parent = blade
-end
-
-local function spawnBoss(parent: Instance): Model
-	local template = resolveTemplate(COMMANDER_NAME, buildCommander)
-	local boss = template:Clone()
-	boss.Name = "TheCorruptedCommander"
-	boss.Parent = parent
-
-	boss:ScaleTo(BossConfig.Scale)
-
-	--[[
-	The rig is resolved first and the Humanoid is read *out of it*.
-
-	`FindFirstChildWhichIsA` is not recursive - it only looks at direct children -
-	and on a character rig the Humanoid is never a direct child of the Model, it
-	lives inside the `Rig`. Reaching for it from the Model therefore returns nil
-	against every correctly-built rig in the game, including the player's, and the
-	failure surfaces as "the Commander has no Humanoid" on a template that plainly
-	has one. The rig is resolved once here and everything else - the Humanoid, the
-	hand that holds the nodachi - is reached through it.
-	]]
-	local rig = boss:FindFirstChild("Rig")
-	if rig == nil or not rig:IsA("Model") then
-		error("[Arena1Builder] CorruptedCommander template had no Rig Model")
-	end
-
-	local humanoid = rig:FindFirstChildOfClass("Humanoid")
-	if humanoid == nil then
-		error("[Arena1Builder] CorruptedCommander's Rig had no Humanoid")
-	end
-
-	humanoid.MaxHealth = BossConfig.MaxHealth
-	humanoid.Health = BossConfig.MaxHealth
-	humanoid.WalkSpeed = 14
-	humanoid.BreakJointsOnDeath = false
-	-- Re-asserted after the clone and the scale: see the note in `buildCommander`.
-	humanoid.AutoRotate = true
-
-	boss:SetAttribute(BossConfig.Attributes.Health, BossConfig.MaxHealth)
-	boss:SetAttribute(BossConfig.Attributes.MaxHealth, BossConfig.MaxHealth)
-	boss:SetAttribute(BossConfig.Attributes.Posture, 0)
-	boss:SetAttribute(BossConfig.Attributes.MaxPosture, BossConfig.MaxPosture)
-	boss:SetAttribute(BossConfig.Attributes.Phase, 1)
-	boss:SetAttribute(BossConfig.Attributes.Engaged, false)
-	boss:SetAttribute(BossConfig.Attributes.State, "Dormant")
-	boss:SetAttribute(BossConfig.Attributes.Vulnerable, false)
-	boss:SetAttribute(BossConfig.Attributes.Defeated, false)
-
-	--[[
-		Settle the clone onto the floor. Same reasoning as the brazier: measure the
-		bounding box, then translate by exactly the difference between the lowest point
-	and the arena floor. Measuring is cheap and happens once per arena build.
-	]]
-	boss:PivotTo(CFrame.new(Arena.Center.X, 70, Arena.Center.Z))
-	local boxCFrame, boxSize = boss:GetBoundingBox()
-	local lowestY = boxCFrame.Position.Y - boxSize.Y * 0.5
-	boss:PivotTo(boss:GetPivot() + Vector3.new(0, Arena.FloorTop - lowestY, 0))
-
-	equipKatana(boss, rig)
-
-	return boss
 end
 
 --[[
@@ -1029,6 +590,38 @@ leaf's open and closed X on the leaf itself; `Boss1Controller` owns the tween,
 because opening and sealing the gate is a decision about the fight, not about
 	the scenery.
 ]]
+--[[
+The dueling box, and the promise that nothing solid is standing in it.
+
+Everything strictly inside the central 60x60 of the courtyard that still
+collides has to be scenery the fight can walk through. The six braziers sit at
++-32 and the perimeter walls at +-40, so this box reaches far enough to catch a
+stray ramp, ash pile or imported prop, and nowhere near far enough to touch
+them.
+
+CanCollide off rather than destroy: the geometry stays visible and queryable
+where it matters, it simply stops being a floor hazard. Runs once, at build
+time - it is a guarantee about the world this file just made, not a per-frame
+rule.
+]]
+local DUEL_CLEAR_HALF = 30
+
+local function clearDuelFloorSnags(folder: Folder): number
+	local cleared = 0
+	for _, descendant in ipairs(folder:GetDescendants()) do
+		if descendant:IsA("BasePart") and descendant.Name ~= "DuelingFloor" and descendant.CanCollide then
+			local dx = math.abs(descendant.Position.X - Arena.Center.X)
+			local dz = math.abs(descendant.Position.Z - Arena.Center.Z)
+			if dx <= DUEL_CLEAR_HALF and dz <= DUEL_CLEAR_HALF then
+				descendant.CanCollide = false
+				descendant.CanTouch = false
+				cleared += 1
+			end
+		end
+	end
+	return cleared
+end
+
 local function build()
 	local hub = Workspace:WaitForChild("SanctuaryHub")
 	local old = hub:FindFirstChild(Arena.FolderName)
@@ -1048,8 +641,21 @@ local function build()
 	local midY = Arena.FloorTop + Arena.WallHeight * 0.5
 	local wallThickness = Arena.WallThickness
 
+	--[[
+		The dueling floor.
+
+		One part, 80x80, flat, and *dedicated*: the whole fight is written
+		against this plane - every reach number, every dash, every line of sight -
+		so it is named for what it is rather than for what it is made of.
+		`makePart` anchors it and leaves `CanQuery` on, so blade sweeps and
+		line-of-sight rays read it as the ground they expect.
+
+		Nothing collidable is allowed to stand on its middle either, which is
+		what `clearDuelFloorSnags` checks at the end of `build` - a snag in the
+		center of a duel is a player who lost to a decoration.
+	]]
 	makePart(
-		"AshStoneFloor",
+		"DuelingFloor",
 		Vector3.new(half * 2, Arena.FloorThickness, half * 2),
 		CFrame.new(Arena.Center.X, Arena.FloorTop - Arena.FloorThickness * 0.5, Arena.Center.Z),
 		COLOR_FLOOR,
@@ -1115,7 +721,7 @@ local function build()
 	local gateLeft, gateRight = makeGate(folder)
 	local bambooCount = makeBamboo(folder)
 
-	local template = resolveTemplate(BRAZIER_NAME, buildBrazier)
+	local template = buildBrazier()
 	local brazierFolder = Instance.new("Folder")
 	brazierFolder.Name = "Braziers"
 	brazierFolder.Parent = folder
@@ -1127,8 +733,12 @@ local function build()
 	end
 
 	local ash = makeAshEmitter(folder)
-	local boss = spawnBoss(folder)
 	local grade = makeGrade()
+
+	local snags = clearDuelFloorSnags(folder)
+	if snags > 0 then
+		warn(string.format("[ARENA 1] Cleared %d collidable snag(s) off the dueling floor.", snags))
+	end
 
 	startFlicker(lights)
 
@@ -1152,7 +762,8 @@ local function build()
 	the contract instead of a parallel one encoded in attributes.
 
 	The parts already carry the names this relies on: the gate leaves are
-	`GateLeafLeft` / `GateLeafRight`, the Commander is `TheCorruptedCommander`, and
+	`GateLeafLeft` / `GateLeafRight`, the Commander is `CorruptedCommander` (built
+	by `Boss1Controller` from `Workspace.Rig`), and
 	the grade is `ARENA_Burn_Grade` under `Lighting`.
 
 	`RoninArenaReady` stays an attribute because it is a plain boolean and it is
@@ -1162,7 +773,7 @@ local function build()
 	folder:SetAttribute("RoninArenaReady", true)
 
 	print(string.format(
-		"[ARENA 1] %s built - %dx%d at (%d, %d, %d), %d braziers, %d bamboo, boss placed",
+		"[ARENA 1] %s built - %dx%d at (%d, %d, %d), %d braziers, %d bamboo, duel floor ready",
 		Arena.Name, half * 2, half * 2,
 		Arena.Center.X, Arena.Center.Y, Arena.Center.Z, #lights, bambooCount
 	))

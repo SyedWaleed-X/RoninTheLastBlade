@@ -102,7 +102,7 @@ centred on the hub's own north face, which would have put a wall through the
 torii the player is walking through.
 
 80x80 with a 24-stud approach: long enough that the Shadow Retreat (which dashes
-backwards) and the gap-closing lunge (30 studs) both have room to be real moves
+backwards) and the gap-closing lunge (25 studs) both have room to be real moves
 instead of animations, and the 24-stud approach is long enough to see the
 braziers over the wall before the gate frame is even on screen.
 ]]
@@ -389,9 +389,10 @@ Steps = nil,
 (e) SHADOW RETREAT & LUNGING THRUST - the gap closer.
 
 Not a move the player can parry their way out of; a move about *distance*. When
-the target is more than `RETREAT_TRIGGER_DISTANCE` (15) studs out, the boss does
-not walk after them and it does not idle. It vanishes backwards, and then
-arrives.
+the player is *crowded* - inside `CROWDED_DISTANCE` (6 studs), a rule the
+controller owns - the boss does not stand and trade. It vanishes backwards, and
+then arrives. Closing distance when the player is far away belongs to the chase
+AI now, so this move is only ever about making space.
 
 Two phases, and the gap between them is the taunt:
 
@@ -401,18 +402,19 @@ Two phases, and the gap between them is the taunt:
     mistaken for one, so it wears no red.
 
   * `Lunge` - after `MOVE_SHADOW_RETREAT.Windup` (0.22s) of stillness, the boss
-    covers `MOVE_LUNGE_DISTANCE` (30) studs at `MOVE_LUNGE_SPEED` (150) in a
+    covers `MOVE_LUNGE_DISTANCE` (25) studs at `MOVE_LUNGE_SPEED` (150) in a
     straight line, blade first, and resolves a strike on contact.
 
-30 studs at 150/s is 0.2s of travel after a 0.22s tell: the player gets 0.42s
-to react to something covering 30 studs, which at a normal 16 studs/s walk is
-nearly two and a half seconds of their own movement. Running is not a strategy;
+25 studs at 150/s is 0.17s of travel after a 0.22s tell: the player gets 0.39s
+to react to something covering 25 studs, which at a normal 16 studs/s walk is
+over a second and a half of their own movement. Running is not a strategy;
 standing your ground is a strategy; and the move is *deflectable*, so standing
 your ground has a reward as well as a cost.
 
-The backwards dash is also the answer to kiting. Without it the boss would have
-to walk, and a walking boss can be outpaced forever, which turns the fight into
-a footrace instead of a duel.
+Pursuit belongs to the chase instead: the Heartbeat pursuit walks the Commander
+down at 16 studs/s the moment the player tries to leave the yard, so this move
+never has to double as a gap closer and stays what it reads as - space, made on
+purpose, before the blade arrives.
 ]]
 local MOVE_SHADOW_RETREAT: BossMoveData = {
 Id = "ShadowRetreat",
@@ -429,12 +431,93 @@ MustJump = false,
 Steps = nil,
 }
 
-local MOVE_SHADOW_RETREAT_TRIGGER_DISTANCE = 15
 local MOVE_SHADOW_RETREAT_DISTANCE = 10
 local MOVE_SHADOW_RETREAT_SPEED = 70
 local MOVE_SHADOW_RETREAT_DURATION = 0.32
-local MOVE_LUNGE_DISTANCE = 30
+local MOVE_LUNGE_DISTANCE = 25
 local MOVE_LUNGE_SPEED = 150
+
+--[[
+S4b - The Flaming Blade Wave.
+
+The ranged answer, and the reason the fight has a third distance band rather
+than two. Without it the only thing the Commander can do to a player standing
+back is walk at them, which makes running backwards a *correct* strategy and
+turns the whole engagement into a chase the player controls.
+
+The bands are therefore a *conversation* rather than a single switch:
+
+    > 18 studs  RANGED    - the Blade Wave. The player is out of the five
+                            melee moves' reach and is being told so.
+    10-18      APPROACH  - the Shadow Lunge. Not an attack: a 35 studs/s
+                            closed with an ember trail, landing in melee
+                            range and immediately committing to a real move.
+    < 10       MELEE     - stalk, then one of the five.
+
+RANGED_THRESHOLD (18) sits above the longest reach in S4 (`PerilousThrust` at
+21 is the exception, and it is deliberately *shorter* than 18 plus the boss's
+own radius) so that a player standing at 20 studs is genuinely safe from
+melee and has to answer the wave instead. It is also below the arena's
+half-extent of 40, so there is real ground to be far away on - a threshold
+larger than the arena would make this move unreachable in the one place it
+can be seen.
+
+WAVE_SPEED (55) is a shade slower than the Shadow Retreat's 70 and much slower
+than the lunge's 150, and for the reason the numbers below are all about: the
+wave is meant to be *dodgeable*. At 55 studs/s it crosses the 10 studs a player
+can cover in a 200ms i-frame dodge with roughly a third of a second to spare,
+which is enough reaction time to be punished for not moving and not so much
+that standing still is safe. A projectile that cannot be answered teaches the
+player that only distance management works, which is the thing this move
+exists to prevent.
+
+WAVE_DAMAGE (20) sits below every melee move in the set and roughly halfway
+between the flurry's 12 and the Cleave's 26. Being hit by the ranged answer
+costs real health, so the player learns to close the gap, but it does not
+outright punish a single misread the way `PerilousSweep`'s 35 does - the wave
+is a repositioning tool, not a perilous move.
+]]
+local MOVE_BLADE_WAVE_DAMAGE = 20
+local MOVE_BLADE_WAVE_SPEED = 55
+local MOVE_BLADE_WAVE_LIFETIME = 3.0
+local MOVE_BLADE_WAVE_RADIUS = 2.6
+local MOVE_BLADE_WAVE_TELEGRAPH = 0.5
+
+--[[
+The Shadow Lunge's own numbers. `CloseSpeed` is unused here (it is a melee
+field) so the dash is described entirely by speed and by the fact that it ends
+in melee range rather than at a fixed distance.
+
+35 studs/s is *half* the Shadow Retreat-lunge's 150 and a little over double
+the chase's 16. That is the band a gap-closer belongs in: fast enough that a
+player at 18 studs has to react to a threat rather than watch a walk, and slow
+enough that it is visible, dodgeable and readable - a 150 studs/s dash across
+the same gap is 0.12s, which is under the human reaction floor and therefore
+just a hit. The ember trail exists to make the 0.5s of travel legible.
+]]
+local MOVE_SHADOW_LUNGE_SPEED = 35
+local MOVE_SHADOW_LUNGE_RECOVERY = 0.34
+local MOVE_SHADOW_LUNGE_EMBER_RATE = 28
+
+--[[
+The stalk bands. Close-range circling is what stops the melee exchange being
+three moves the player has memorised, and it is the only thing in the fight
+that is deliberately *not* progress.
+]]
+local MOVE_STALK_RADIUS = 9.5
+local MOVE_STALK_SPEED = 11
+local MOVE_STALK_MIN_DURATION = 0.5
+local MOVE_STALK_MAX_DURATION = 1.1
+local MOVE_STALK_RETREAT_COOLDOWN = 6
+
+--[[
+The three distance bands, named so the controller reads as prose rather than
+as arithmetic. `MELEE` is 10 because that is `COMBAT_DISTANCE` in the controller
+- the radius inside which the five melee moves resolve against a standing
+player - and the two are declared here so they cannot drift.
+]]
+local MELEE_DISTANCE = 10
+local RANGED_THRESHOLD = 18
 
 --[[
 The selection table. The literal is built into an annotated local first and
@@ -495,6 +578,12 @@ is to pre-allocate everything and drive at 60Hz. This does neither: it is a
 the boss's *movement* between decisions is done by the Humanoid, not by this
 loop, so the locomotion stays at full framerate regardless.
 
+The *chase* is the one exception, and it is deliberately a different loop: a
+`RunService.Heartbeat` callback that reads one pre-computed target, compares two
+numbers and calls `Humanoid:MoveTo`. It allocates nothing (ARCHITECTURE #4) and
+it is what makes the Commander pursue at the frame's cadence instead of at this
+loop's 50ms - the decision still happens here, the walking happens there.
+
 The cost of 50ms is real and is worth naming: a strike's active window is 0.10s
 of wall clock, which is 2 ticks. Two ticks is enough to fire the hit exactly once
 because the per-swing debounce is a latch, not a counter - but it is why no move
@@ -534,7 +623,7 @@ ShadowRetreat = 0,
 
 --[[
 `ShadowRetreat` is weighted 0 in both tables on purpose. It is not chosen by the
-roulette; it is chosen by a *rule* - the player is more than 15 studs away, so
+roulette; it is chosen by a *rule* - the player is crowded (inside 6 studs), so
 the boss uses it, and it is skipped entirely when they are not. Letting the
 roulette pick it would mean the boss sometimes "chose" to retreat while standing
 three studs from the player, which reads as broken AI.
@@ -637,12 +726,32 @@ DragonCleave = MOVE_DRAGON_CLEAVE,
 PerilousThrust = MOVE_PERILOUS_THRUST,
 PerilousSweep = MOVE_PERILOUS_SWEEP,
 ShadowRetreat = MOVE_SHADOW_RETREAT,
-RetreatTriggerDistance = MOVE_SHADOW_RETREAT_TRIGGER_DISTANCE,
 RetreatDistance = MOVE_SHADOW_RETREAT_DISTANCE,
 RetreatSpeed = MOVE_SHADOW_RETREAT_SPEED,
 RetreatDuration = MOVE_SHADOW_RETREAT_DURATION,
 LungeDistance = MOVE_LUNGE_DISTANCE,
 LungeSpeed = MOVE_LUNGE_SPEED,
+
+		-- S4b: the ranged answer, the gap-closer, and the band boundaries the
+		-- two of them exist to create.
+		BladeWaveDamage = MOVE_BLADE_WAVE_DAMAGE,
+		BladeWaveSpeed = MOVE_BLADE_WAVE_SPEED,
+		BladeWaveLifetime = MOVE_BLADE_WAVE_LIFETIME,
+		BladeWaveRadius = MOVE_BLADE_WAVE_RADIUS,
+		BladeWaveTelegraph = MOVE_BLADE_WAVE_TELEGRAPH,
+
+		ShadowLungeSpeed = MOVE_SHADOW_LUNGE_SPEED,
+		ShadowLungeRecovery = MOVE_SHADOW_LUNGE_RECOVERY,
+		ShadowLungeEmberRate = MOVE_SHADOW_LUNGE_EMBER_RATE,
+
+		StalkRadius = MOVE_STALK_RADIUS,
+		StalkSpeed = MOVE_STALK_SPEED,
+		StalkMinDuration = MOVE_STALK_MIN_DURATION,
+		StalkMaxDuration = MOVE_STALK_MAX_DURATION,
+		StalkRetreatCooldown = MOVE_STALK_RETREAT_COOLDOWN,
+
+		MeleeDistance = MELEE_DISTANCE,
+		RangedThreshold = RANGED_THRESHOLD,
 }),
 
 Telegraph = table.freeze({
